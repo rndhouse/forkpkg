@@ -8,25 +8,17 @@
 `forkpkg` turns a Nix package into an editable local Git fork of the exact
 post-patch source tree Nix builds.
 
-Edit the source like a normal checkout, then rebuild it through the original
-Nix package definition so dependencies, build flags, outputs, and activation
-stay Nix-owned.
+Edit the source like a normal checkout, then enable the fork through Nix so the
+package is rebuilt and activated by the original package definition.
 
-## Edit and Build
+## Edit and Enable
 
 ```sh
 forkpkg fork nixpkgs#hello
 ```
 
-Then change into the `source:` directory printed by `forkpkg` and edit files:
-
-```sh
-forkpkg build
-```
-
-## Use the Rebuild
-
-For command-line tools, you can use the rebuilt version from your shell:
+Then change into the `source:` directory printed by `forkpkg`, edit files, and
+enable the fork:
 
 ```sh
 forkpkg enable hello
@@ -39,6 +31,15 @@ Nix profile. NixOS and Home Manager packages can use generated modules and the
 normal switch flow.
 
 Run `forkpkg targets` to see the activation choices for a built fork.
+
+## Build Without Activating
+
+Use `build` when you want to inspect the rebuilt output path without changing
+what your shell or system uses.
+
+```sh
+forkpkg build hello
+```
 
 ## Multiple Forks
 
