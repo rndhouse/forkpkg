@@ -242,6 +242,12 @@ enum BackendDetails {
         module: Option<PathBuf>,
         overlay: Option<PathBuf>,
     },
+    LegacyPathShim {
+        executable_count: usize,
+    },
+    LegacySystemdUserService {
+        service_count: usize,
+    },
 }
 
 fn list(json: bool) -> Result<()> {
@@ -492,6 +498,12 @@ fn targets(path: Option<PathBuf>, json: bool) -> Result<()> {
                     println!("  overlay: {}", overlay.display());
                 }
             }
+            BackendDetails::LegacyPathShim { executable_count } => {
+                println!("  executable_count: {executable_count}");
+            }
+            BackendDetails::LegacySystemdUserService { service_count } => {
+                println!("  service_count: {service_count}");
+            }
         }
         for evidence in &backend.evidence {
             println!("  evidence: {evidence}");
@@ -531,6 +543,14 @@ fn enable(
             "--switch only applies to module backends; nix-profile activates immediately"
         );
     }
+    if switch
+        && matches!(
+            backend,
+            ActivationBackend::PathShim | ActivationBackend::SystemdUserService
+        )
+    {
+        anyhow::bail!("--switch only applies to Nix module backends");
+    }
 
     let record = match backend {
         ActivationBackend::Auto => unreachable!("auto backend should be resolved"),
@@ -552,6 +572,15 @@ fn enable(
         ActivationBackend::HomeManagerModule => {
             activation::enable_home_manager_module(&metadata, &workspace, &output)?
         }
+        ActivationBackend::PathShim if dry_run => {
+            activation::plan_path_shim(&metadata, &workspace, &output)?
+        }
+        ActivationBackend::PathShim => {
+            activation::enable_path_shim(&metadata, &workspace, &output)?
+        }
+        ActivationBackend::SystemdUserService => {
+            enable_legacy_systemd_user_service(&metadata, &workspace, &output, dry_run)?
+        }
     };
 
     if dry_run {
@@ -561,6 +590,8 @@ fn enable(
     }
     println!("mode: {}", record.mode);
     println!("output: {}", record.build_output.display());
+    print_legacy_link_records(&record, dry_run);
+    print_service_records(&record, dry_run);
     print_profile_records(&record, dry_run);
     print_module_records(&record, dry_run);
     maybe_switch_backend(backend, switch, flake, dry_run)?;
@@ -610,6 +641,73 @@ fn disable(path: Option<PathBuf>, dry_run: bool) -> Result<()> {
     print_module_records(&record, dry_run);
 
     Ok(())
+}
+
+fn enable_legacy_systemd_user_service(
+    metadata: &Metadata,
+    workspace: &workspace::Workspace,
+    output: &Path,
+    dry_run: bool,
+) -> Result<activation::ActivationRecord> {
+    let report = targets::discover(output)?;
+    let target = select_systemd_user_service_target(&report)?;
+    let spec = targets::systemd_user_service_spec(target)?;
+    let executable = spec
+        .executable
+        .as_ref()
+        .context("systemd user service target has no absolute executable")?;
+
+    if !executable.starts_with(output) {
+        anyhow::bail!(
+            "refusing service activation because target executable is outside the forked output: {}",
+            executable.display()
+        );
+    }
+
+    if dry_run {
+        activation::plan_systemd_user_service(
+            metadata,
+            workspace,
+            output,
+            &spec.service,
+            &spec.service_file,
+            &spec.exec_start,
+            executable,
+        )
+    } else {
+        activation::enable_systemd_user_service(
+            metadata,
+            workspace,
+            output,
+            &spec.service,
+            &spec.service_file,
+            &spec.exec_start,
+            executable,
+        )
+    }
+}
+
+fn select_systemd_user_service_target(
+    report: &targets::TargetReport,
+) -> Result<&targets::ActivationTarget> {
+    let supported = report
+        .targets
+        .iter()
+        .filter(|target| target.supported && target.kind == "systemd-user-service")
+        .collect::<Vec<_>>();
+
+    match supported.as_slice() {
+        [target] => Ok(*target),
+        [] => anyhow::bail!("no supported systemd user service target found"),
+        _ => {
+            let ids = supported
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("multiple systemd user service targets found ({ids})")
+        }
+    }
 }
 
 fn disable_all(dry_run: bool) -> Result<()> {
@@ -914,6 +1012,48 @@ fn print_service_records(record: &activation::ActivationRecord, dry_run: bool) {
     }
 }
 
+fn print_legacy_link_records(record: &activation::ActivationRecord, dry_run: bool) {
+    for link in &record.links {
+        match &link.previous {
+            PreviousLink::Absent => {
+                if dry_run {
+                    println!(
+                        "would create: {} -> {}",
+                        link.link.display(),
+                        link.target.display()
+                    );
+                    print_target_blake3(link);
+                    println!("previous: absent");
+                } else {
+                    println!("link: {} -> {}", link.link.display(), link.target.display());
+                    print_target_blake3(link);
+                }
+            }
+            PreviousLink::BackedUp { backup } => {
+                if dry_run {
+                    println!("would move existing: {}", link.link.display());
+                    println!("backup: {}", backup.display());
+                    println!(
+                        "would create: {} -> {}",
+                        link.link.display(),
+                        link.target.display()
+                    );
+                    print_target_blake3(link);
+                } else {
+                    println!("link: {} -> {}", link.link.display(), link.target.display());
+                    print_target_blake3(link);
+                    println!("previous backup: {}", backup.display());
+                }
+            }
+        }
+    }
+    if !record.links.is_empty()
+        && let Ok(Some(hint)) = activation::path_hint()
+    {
+        println!("warning: {hint}");
+    }
+}
+
 fn print_profile_records(record: &activation::ActivationRecord, _dry_run: bool) {
     for profile in &record.profiles {
         println!("profile: {}", profile_display(profile.profile.as_ref()));
@@ -1011,7 +1151,10 @@ fn switch_command(backend: ActivationBackend, flake: Option<&str>) -> Result<Swi
             program: "home-manager".to_owned(),
             args: vec!["switch".to_owned()],
         },
-        ActivationBackend::Auto | ActivationBackend::NixProfile => {
+        ActivationBackend::Auto
+        | ActivationBackend::NixProfile
+        | ActivationBackend::PathShim
+        | ActivationBackend::SystemdUserService => {
             anyhow::bail!("backend has no switch command: {backend:?}")
         }
     };
@@ -1067,7 +1210,16 @@ fn select_backend(requested: ActivationBackend, output: &Path) -> Result<Activat
 fn discover_backends(metadata: &Metadata, output: &Path) -> Result<BackendReport> {
     let active = activation::status(metadata)?;
     let active_mode = active.as_ref().map(|record| record.mode.as_str());
-    let service_managed = output_looks_service_managed(output)?;
+    let target_report = targets::discover(output)?;
+    let service_count = systemd_user_service_target_count(&target_report);
+    let service_managed = target_report.targets.iter().any(|target| {
+        matches!(
+            target.details,
+            targets::TargetDetails::SystemdUserService { .. }
+                | targets::TargetDetails::DbusService { .. }
+        )
+    });
+    let executable_count = output_bin_executable_count(output)?;
     let has_profile_files = output.join("bin").is_dir()
         || output.join("share/applications").is_dir()
         || output.join("share").is_dir();
@@ -1185,6 +1337,32 @@ fn discover_backends(metadata: &Metadata, output: &Path) -> Result<BackendReport
         },
     });
 
+    backends.push(BackendEntry {
+        id: "path-shim".to_owned(),
+        kind: "path-shim".to_owned(),
+        confidence: if executable_count > 0 { "low" } else { "none" }.to_owned(),
+        supported: executable_count > 0,
+        active: active_mode == Some("path-shim"),
+        evidence: vec![
+            "legacy direct activation; bypasses Nix profile/module ownership".to_owned(),
+            format!("output has {executable_count} executable(s) in bin/"),
+        ],
+        details: BackendDetails::LegacyPathShim { executable_count },
+    });
+
+    backends.push(BackendEntry {
+        id: "systemd-user-service".to_owned(),
+        kind: "systemd-user-service".to_owned(),
+        confidence: if service_count == 1 { "low" } else { "none" }.to_owned(),
+        supported: service_count == 1,
+        active: active_mode == Some("systemd-user-service"),
+        evidence: vec![
+            "legacy direct activation; writes a user systemd override".to_owned(),
+            format!("output has {service_count} supported systemd user service target(s)"),
+        ],
+        details: BackendDetails::LegacySystemdUserService { service_count },
+    });
+
     Ok(BackendReport {
         output: output.to_path_buf(),
         backends,
@@ -1200,6 +1378,44 @@ fn output_looks_service_managed(output: &Path) -> Result<bool> {
                 | targets::TargetDetails::DbusService { .. }
         )
     }))
+}
+
+fn systemd_user_service_target_count(report: &targets::TargetReport) -> usize {
+    report
+        .targets
+        .iter()
+        .filter(|target| target.supported && target.kind == "systemd-user-service")
+        .count()
+}
+
+fn output_bin_executable_count(output: &Path) -> Result<usize> {
+    let bin_dir = output.join("bin");
+    if !bin_dir.is_dir() {
+        return Ok(0);
+    }
+
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(&bin_dir)
+        .with_context(|| format!("failed to read {}", bin_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", bin_dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        if !(file_type.is_file() || file_type.is_symlink()) {
+            continue;
+        }
+        let metadata = std::fs::metadata(entry.path())
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        if metadata.is_file()
+            && std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o111 != 0
+        {
+            count += 1;
+        }
+    }
+
+    Ok(count)
 }
 
 fn is_nixos() -> bool {

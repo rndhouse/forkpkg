@@ -24,12 +24,18 @@ hello
 forkpkg disable
 ```
 
-`enable` links the rebuilt command into `~/.local/bin`. `disable` removes that
-link and restores the previous command when there was one.
+By default, `enable` asks Nix to own activation. Command-line packages use
+`nix profile add`; `disable` removes the fork from that profile. Packages that
+belong to NixOS or Home Manager can use generated overlay modules and the
+normal `nixos-rebuild switch` or `home-manager switch` flow.
+
+Direct legacy activation modes are still useful for experimentation and cleanup:
+`path-shim` creates links in `~/.local/bin`, and `systemd-user-service` writes a
+user systemd override. They are not the default activation path.
 
 ## Current Scope
 
-`forkpkg` works best with normal command-line packages.
+`forkpkg` works best with normal command-line packages and conventional NixOS
+packages whose source can be replaced with a local post-patch tree.
 
-It does not handle NixOS services or system activation. Some packages with
-custom Nix build logic may not work yet.
+Some packages with custom Nix build logic may not work yet.

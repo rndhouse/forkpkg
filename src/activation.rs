@@ -141,7 +141,6 @@ impl ActivationPaths {
     }
 }
 
-#[allow(dead_code)]
 pub fn enable_path_shim(
     metadata: &Metadata,
     workspace: &Workspace,
@@ -153,7 +152,6 @@ pub fn enable_path_shim(
     Ok(record)
 }
 
-#[allow(dead_code)]
 pub fn plan_path_shim(
     metadata: &Metadata,
     workspace: &Workspace,
@@ -262,7 +260,6 @@ fn enable_nix_module(
     Ok(record)
 }
 
-#[allow(dead_code)]
 pub fn enable_systemd_user_service(
     metadata: &Metadata,
     workspace: &Workspace,
@@ -287,7 +284,6 @@ pub fn enable_systemd_user_service(
     Ok(record)
 }
 
-#[allow(dead_code)]
 pub fn plan_systemd_user_service(
     metadata: &Metadata,
     workspace: &Workspace,

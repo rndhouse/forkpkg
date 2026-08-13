@@ -138,4 +138,6 @@ pub enum ActivationBackend {
     NixProfile,
     NixosModule,
     HomeManagerModule,
+    PathShim,
+    SystemdUserService,
 }
