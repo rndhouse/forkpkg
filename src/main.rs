@@ -32,6 +32,7 @@ fn run() -> Result<()> {
         Command::Fork { installable, label } => fork(&installable, label.as_deref()),
         Command::List { json } => list(json),
         Command::Build { path, label } => build(path, label.as_deref()),
+        Command::Apply { patch, path, label } => apply(patch, path, label.as_deref()),
         Command::Export {
             path,
             label,
@@ -394,6 +395,20 @@ fn build(path: Option<PathBuf>, label: Option<&str>) -> Result<()> {
     let metadata = Metadata::read(&workspace.metadata)?;
     let output = nix::build_local_source(&metadata, &workspace.source)?;
     println!("{}", output.display());
+    Ok(())
+}
+
+fn apply(patch: PathBuf, path: Option<PathBuf>, label: Option<&str>) -> Result<()> {
+    let workspace = workspace::resolve_labeled(path, label)?;
+    let metadata = Metadata::read(&workspace.metadata)?;
+    let summary = sharing::apply_patch(&workspace, &metadata, &patch)?;
+
+    println!("applied: {}", summary.patch.display());
+    println!("method: {}", summary.method);
+    println!("base_commit: {}", summary.base_commit);
+    println!("head: {}", summary.head_commit);
+    println!("commits_on_top: {}", summary.commits_on_top);
+
     Ok(())
 }
 

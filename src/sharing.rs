@@ -30,6 +30,15 @@ pub struct ImportSummary {
     pub commit_count: u64,
 }
 
+#[derive(Debug)]
+pub struct ApplySummary {
+    pub patch: PathBuf,
+    pub method: &'static str,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub commits_on_top: u64,
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ShareArtifact {
     format: u32,
@@ -218,6 +227,41 @@ pub fn import_changes(
         base_commit: metadata.base.git_commit.clone(),
         head_commit,
         commit_count: share.changes.commit_count,
+    })
+}
+
+pub fn apply_patch(
+    workspace: &Workspace,
+    metadata: &Metadata,
+    patch: &Path,
+) -> Result<ApplySummary> {
+    let patch = patch
+        .canonicalize()
+        .with_context(|| format!("failed to resolve patch file {}", patch.display()))?;
+    if !patch.is_file() {
+        bail!("patch file does not exist: {}", patch.display());
+    }
+
+    let repo = git::repo_state(&workspace.source, &metadata.base.git_commit)?;
+    if !repo.base_commit_present {
+        bail!(
+            "target fork is missing its recorded base commit: {}",
+            metadata.base.git_commit
+        );
+    }
+    if repo.dirty {
+        bail!("target source has uncommitted changes; commit or stash them before applying");
+    }
+
+    git::apply_patch_mailbox(&workspace.source, &patch)?;
+
+    let repo = git::repo_state(&workspace.source, &metadata.base.git_commit)?;
+    Ok(ApplySummary {
+        patch,
+        method: "git-am",
+        base_commit: metadata.base.git_commit.clone(),
+        head_commit: repo.head_commit,
+        commits_on_top: repo.commits_on_top.unwrap_or(0),
     })
 }
 

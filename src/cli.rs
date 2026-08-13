@@ -40,6 +40,21 @@ pub enum Command {
         label: Option<String>,
     },
 
+    /// Apply a Git patch to a fork source tree.
+    Apply {
+        /// Git mailbox patch to apply with git am.
+        #[arg(value_name = "PATCH")]
+        patch: PathBuf,
+
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
+        path: Option<PathBuf>,
+
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
+    },
+
     /// Export committed fork changes as a portable share artifact.
     Export {
         /// Fork name, workspace, or source directory. Defaults to the current directory.

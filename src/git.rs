@@ -233,3 +233,62 @@ fn run_command(command: &mut Command, label: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::{apply_patch_mailbox, run_command};
+
+    #[test]
+    fn applies_mailbox_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        let patch = temp.path().join("change.patch");
+
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init"]);
+        configure_user(&source);
+        fs::write(source.join("message.txt"), "base\n").unwrap();
+        git(&source, &["add", "message.txt"]);
+        git(&source, &["commit", "-m", "base"]);
+
+        let mut clone = Command::new("git");
+        clone.arg("clone").arg(&source).arg(&target);
+        run_command(&mut clone, "git clone").unwrap();
+        configure_user(&target);
+
+        fs::write(source.join("message.txt"), "patched\n").unwrap();
+        git(&source, &["commit", "-am", "patch message"]);
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["format-patch", "-1", "--stdout"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        fs::write(&patch, output.stdout).unwrap();
+
+        apply_patch_mailbox(&target, &patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("message.txt")).unwrap(),
+            "patched\n"
+        );
+    }
+
+    fn configure_user(repo: &Path) {
+        git(repo, &["config", "user.name", "forkpkg test"]);
+        git(repo, &["config", "user.email", "forkpkg@example.invalid"]);
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repo).args(args);
+        run_command(&mut command, "git test").unwrap();
+    }
+}

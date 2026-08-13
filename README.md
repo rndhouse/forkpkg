@@ -15,20 +15,20 @@ package is rebuilt and activated by the original package definition.
 
 This repository includes an example patch for `xdg-desktop-portal-gnome` that
 changes the remote desktop permission dialog to show which app is requesting
-access. From this repository checkout:
+access.
 
 ```sh
-FORKPKG_CHECKOUT=$PWD
 forkpkg fork nixpkgs#xdg-desktop-portal-gnome --label remote-interaction
-cd ~/.local/share/forkpkg/forks/xdg-desktop-portal-gnome/remote-interaction/source
-git am "$FORKPKG_CHECKOUT/examples/xdg-desktop-portal-gnome-remote-interaction.patch"
+forkpkg apply examples/xdg-desktop-portal-gnome-remote-interaction.patch \
+  xdg-desktop-portal-gnome \
+  --label remote-interaction
 ```
 
 Use `build` while iterating; it checks the edited source through Nix and prints
 the rebuilt output path without changing what your shell or system uses.
 
 ```sh
-forkpkg build
+forkpkg build xdg-desktop-portal-gnome --label remote-interaction
 ```
 
 ## Enable/Disable Forks
