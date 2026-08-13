@@ -42,7 +42,7 @@ pub enum Command {
 
     /// Apply a Git patch to a fork source tree.
     Apply {
-        /// Git mailbox patch to apply with git am.
+        /// Git mailbox patch to apply with git am, or "-" to read from stdin.
         #[arg(value_name = "PATCH")]
         patch: PathBuf,
 

@@ -7,6 +7,7 @@ mod sharing;
 mod targets;
 mod workspace;
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -401,9 +402,27 @@ fn build(path: Option<PathBuf>, label: Option<&str>) -> Result<()> {
 fn apply(patch: PathBuf, path: Option<PathBuf>, label: Option<&str>) -> Result<()> {
     let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
-    let summary = sharing::apply_patch(&workspace, &metadata, &patch)?;
+    let mut stdin_patch = None;
+    let patch_path = if patch.as_os_str() == "-" {
+        let mut file = tempfile::NamedTempFile::new()
+            .context("failed to create temporary patch file for stdin")?;
+        io::copy(&mut io::stdin().lock(), &mut file).context("failed to read patch from stdin")?;
+        file.flush().context("failed to flush patch from stdin")?;
+        let path = file.path().to_path_buf();
+        stdin_patch = Some(file);
+        path
+    } else {
+        patch
+    };
 
-    println!("applied: {}", summary.patch.display());
+    let summary = sharing::apply_patch(&workspace, &metadata, &patch_path)?;
+    let patch_display = if stdin_patch.is_some() {
+        "stdin".to_owned()
+    } else {
+        summary.patch.display().to_string()
+    };
+
+    println!("applied: {patch_display}");
     println!("method: {}", summary.method);
     println!("base_commit: {}", summary.base_commit);
     println!("head: {}", summary.head_commit);
