@@ -11,7 +11,7 @@ post-patch source tree Nix builds.
 Edit the source like a normal checkout, then enable the fork through Nix so the
 package is rebuilt and activated by the original package definition.
 
-## Fork, Edit, Deploy
+## Fork and Edit
 
 ```sh
 forkpkg fork nixpkgs#hello
