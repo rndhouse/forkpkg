@@ -31,23 +31,44 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Fork { installable, label } => fork(&installable, label.as_deref()),
         Command::List { json } => list(json),
-        Command::Build { path } => build(path),
-        Command::Export { path, output } => export(path, output),
-        Command::Import { artifact, path } => import(artifact, path),
-        Command::Info { path } => info(path),
-        Command::Targets { path, json } => targets(path, json),
+        Command::Build { path, label } => build(path, label.as_deref()),
+        Command::Export {
+            path,
+            label,
+            output,
+        } => export(path, label.as_deref(), output),
+        Command::Import {
+            artifact,
+            path,
+            label,
+        } => import(artifact, path, label.as_deref()),
+        Command::Info { path, label } => info(path, label.as_deref()),
+        Command::Targets { path, label, json } => targets(path, label.as_deref(), json),
         Command::Enable {
             path,
+            label,
             backend,
             profile,
             switch,
             flake,
             dry_run,
-        } => enable(path, backend, profile, switch, flake.as_deref(), dry_run),
-        Command::Disable { path, dry_run } => disable(path, dry_run),
+        } => enable(
+            path,
+            label.as_deref(),
+            backend,
+            profile,
+            switch,
+            flake.as_deref(),
+            dry_run,
+        ),
+        Command::Disable {
+            path,
+            label,
+            dry_run,
+        } => disable(path, label.as_deref(), dry_run),
         Command::DisableAll { dry_run } => disable_all(dry_run),
         Command::Doctor => doctor(),
-        Command::Status { path } => status(path),
+        Command::Status { path, label } => status(path, label.as_deref()),
     }
 }
 
@@ -155,7 +176,7 @@ fn fork(installable: &str, requested_label: Option<&str>) -> Result<()> {
         .with_context(|| format!("workspace remains at {}", workspace.root.display()))?;
 
     println!("workspace: {}", workspace.root.display());
-    println!("fork: {workspace_name}/{label}");
+    println!("fork: {}", fork_reference(&workspace_name, &label));
     println!("source: {}", workspace.source.display());
     println!("base_commit: {base_commit}");
     println!("output: {}", output.display());
@@ -368,16 +389,16 @@ fn collect_list() -> Result<ListOutput> {
     })
 }
 
-fn build(path: Option<PathBuf>) -> Result<()> {
-    let workspace = workspace::resolve(path)?;
+fn build(path: Option<PathBuf>, label: Option<&str>) -> Result<()> {
+    let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let output = nix::build_local_source(&metadata, &workspace.source)?;
     println!("{}", output.display());
     Ok(())
 }
 
-fn export(path: Option<PathBuf>, output: PathBuf) -> Result<()> {
-    let workspace = workspace::resolve(path)?;
+fn export(path: Option<PathBuf>, label: Option<&str>, output: PathBuf) -> Result<()> {
+    let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let summary = sharing::export_changes(&workspace, &metadata, &output)?;
 
@@ -389,8 +410,8 @@ fn export(path: Option<PathBuf>, output: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn import(artifact: PathBuf, path: Option<PathBuf>) -> Result<()> {
-    let workspace = workspace::resolve(path)?;
+fn import(artifact: PathBuf, path: Option<PathBuf>, label: Option<&str>) -> Result<()> {
+    let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let summary = sharing::import_changes(&workspace, &metadata, &artifact)?;
 
@@ -403,8 +424,8 @@ fn import(artifact: PathBuf, path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn info(path: Option<PathBuf>) -> Result<()> {
-    let workspace = workspace::resolve(path)?;
+fn info(path: Option<PathBuf>, label: Option<&str>) -> Result<()> {
+    let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let package = metadata
         .package
@@ -443,8 +464,8 @@ fn info(path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn targets(path: Option<PathBuf>, json: bool) -> Result<()> {
-    let workspace = workspace::resolve(path)?;
+fn targets(path: Option<PathBuf>, label: Option<&str>, json: bool) -> Result<()> {
+    let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let output = nix::build_local_source(&metadata, &workspace.source)?;
     let report = discover_backends(&metadata, &output)?;
@@ -515,13 +536,14 @@ fn targets(path: Option<PathBuf>, json: bool) -> Result<()> {
 
 fn enable(
     path: Option<PathBuf>,
+    label: Option<&str>,
     requested_backend: ActivationBackend,
     profile: Option<PathBuf>,
     switch: bool,
     flake: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    let workspace = workspace::resolve(path)?;
+    let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
 
     if dry_run {
@@ -599,8 +621,8 @@ fn enable(
     Ok(())
 }
 
-fn disable(path: Option<PathBuf>, dry_run: bool) -> Result<()> {
-    let workspace = workspace::resolve(path)?;
+fn disable(path: Option<PathBuf>, label: Option<&str>, dry_run: bool) -> Result<()> {
+    let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let record = activation::disable_plan(&metadata)?;
     if !dry_run {
@@ -870,8 +892,8 @@ fn doctor() -> Result<()> {
     Ok(())
 }
 
-fn status(path: Option<PathBuf>) -> Result<()> {
-    let workspace = workspace::resolve(path)?;
+fn status(path: Option<PathBuf>, label: Option<&str>) -> Result<()> {
+    let workspace = workspace::resolve_labeled(path, label)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let repo = git::repo_state(&workspace.source, &metadata.base.git_commit)?;
     let package = metadata
@@ -1453,11 +1475,13 @@ fn fork_label_or_default(
 }
 
 fn fork_reference(package: &str, label: &str) -> String {
-    format!(
-        "{}/{}",
-        workspace::sanitize_workspace_name(package),
-        workspace::sanitize_workspace_name(label)
-    )
+    let package = workspace::sanitize_workspace_name(package);
+    let label = workspace::sanitize_workspace_name(label);
+    if label == workspace::DEFAULT_LABEL {
+        package
+    } else {
+        format!("{package} --label {label}")
+    }
 }
 
 fn workspace_name(resolved: &nix::ResolvedPackage) -> String {

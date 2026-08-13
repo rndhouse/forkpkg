@@ -16,6 +16,13 @@ Then change into the `source:` directory printed by `forkpkg` and edit files:
 forkpkg build
 ```
 
+Managed forks are selected by package name and optional label:
+
+```sh
+forkpkg info ripgrep
+forkpkg info xdg-desktop-portal-gnome --label remote-interaction
+```
+
 For command-line tools, you can use the rebuilt version from your shell:
 
 ```sh

@@ -34,6 +34,10 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
     },
 
     /// Export committed fork changes as a portable share artifact.
@@ -41,6 +45,10 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
 
         /// Artifact path to create.
         #[arg(short, long, value_name = "FILE")]
@@ -56,6 +64,10 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
     },
 
     /// Print metadata for a fork workspace.
@@ -63,6 +75,10 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
     },
 
     /// Discover activation targets for a fork.
@@ -70,6 +86,10 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
 
         /// Emit structured JSON.
         #[arg(long)]
@@ -81,6 +101,10 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
 
         /// Nix activation backend to use.
         #[arg(long, value_enum, default_value_t = ActivationBackend::Auto)]
@@ -109,6 +133,10 @@ pub enum Command {
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
 
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
+
         /// Preview deactivation without changing local machine state.
         #[arg(long)]
         dry_run: bool,
@@ -129,6 +157,10 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Fork label. Defaults to "default" for managed fork names.
+        #[arg(long)]
+        label: Option<String>,
     },
 }
 

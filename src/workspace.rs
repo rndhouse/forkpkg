@@ -130,17 +130,28 @@ pub fn find(start: Option<PathBuf>) -> Result<Workspace> {
     }
 }
 
-pub fn resolve(reference: Option<PathBuf>) -> Result<Workspace> {
+pub fn resolve_labeled(reference: Option<PathBuf>, label: Option<&str>) -> Result<Workspace> {
     let Some(reference) = reference else {
+        if label.is_some() {
+            bail!("--label requires a managed fork name");
+        }
         return find(None);
     };
 
     if reference.exists() {
+        if label.is_some() {
+            bail!("--label cannot be used with a filesystem path");
+        }
         return find(Some(reference));
     }
 
-    if let Some((package, label)) = managed_reference(&reference) {
-        return resolve_managed_reference(&package, label.as_deref());
+    if let Some((package, inline_label)) = managed_reference(&reference) {
+        if label.is_some() && inline_label.is_some() {
+            bail!("use either --label or package/label, not both");
+        }
+
+        let label = label.or(inline_label.as_deref()).unwrap_or(DEFAULT_LABEL);
+        return resolve_managed_reference(&package, Some(label));
     }
 
     bail!("path does not exist: {}", reference.display());
