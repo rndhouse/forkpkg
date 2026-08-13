@@ -18,6 +18,12 @@ forkpkg fork nixpkgs#hello
 ```
 
 Then change into the `source:` directory printed by `forkpkg` and edit files.
+Use `build` while iterating; it checks the edited source through Nix and prints
+the rebuilt output path without changing what your shell or system uses.
+
+```sh
+forkpkg build
+```
 
 ## Enable/Disable Forks
 
@@ -35,15 +41,6 @@ Nix profile. NixOS and Home Manager packages can use generated modules and the
 normal switch flow.
 
 Run `forkpkg targets` to see the activation choices for a built fork.
-
-## Build Without Activating
-
-Use `build` when you want to inspect the rebuilt output path without changing
-what your shell or system uses.
-
-```sh
-forkpkg build hello
-```
 
 ## Multiple Forks
 
