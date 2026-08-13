@@ -1,10 +1,10 @@
-<h1 align="center">forkpkg</h1>
-
-<p align="center"><strong>Local editable forks for Nix packages.</strong></p>
-
 <p align="center">
   <img src="assets/forkpkg-logo.png" alt="forkpkg logo" width="160">
 </p>
+
+<h1 align="center">forkpkg</h1>
+
+<p align="center"><strong>Local editable forks for Nix packages.</strong></p>
 
 `forkpkg` creates a local editable fork of a Nix package.
 
