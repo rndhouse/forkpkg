@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -10,6 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::metadata::Metadata;
+use crate::nix;
 use crate::workspace::{self, Workspace};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +30,10 @@ pub struct ActivationRecord {
     pub links: Vec<LinkRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<ProfileRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<ModuleRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +55,23 @@ pub struct ServiceRecord {
     pub target: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_blake3: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PathBuf>,
+    pub store_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element: Option<String>,
+    pub priority: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleRecord {
+    pub backend: String,
+    pub overlay: PathBuf,
+    pub module: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +117,9 @@ impl ActivationRecordEntry {
 #[derive(Debug, Clone)]
 struct ActivationPaths {
     activations_dir: PathBuf,
+    #[allow(dead_code)]
     user_bin_dir: PathBuf,
+    #[allow(dead_code)]
     user_config_dir: PathBuf,
 }
 
@@ -116,6 +141,7 @@ impl ActivationPaths {
     }
 }
 
+#[allow(dead_code)]
 pub fn enable_path_shim(
     metadata: &Metadata,
     workspace: &Workspace,
@@ -127,6 +153,7 @@ pub fn enable_path_shim(
     Ok(record)
 }
 
+#[allow(dead_code)]
 pub fn plan_path_shim(
     metadata: &Metadata,
     workspace: &Workspace,
@@ -136,6 +163,106 @@ pub fn plan_path_shim(
     plan_path_shim_with_paths(metadata, workspace, build_output, &paths)
 }
 
+pub fn enable_nix_profile(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+    profile: Option<&Path>,
+) -> Result<ActivationRecord> {
+    let paths = ActivationPaths::from_env()?;
+    let mut record =
+        plan_nix_profile_with_paths(metadata, workspace, build_output, profile, &paths)?;
+    let profile_record = record
+        .profiles
+        .first()
+        .ok_or_else(|| anyhow!("nix-profile activation record has no profile entry"))?;
+
+    nix_profile_add(
+        profile_record.profile.as_deref(),
+        &profile_record.store_path,
+        profile_record.priority,
+    )?;
+
+    if let Some(profile_record) = record.profiles.first_mut() {
+        profile_record.element = find_profile_element(
+            profile_record.profile.as_deref(),
+            &profile_record.store_path,
+        )?;
+    }
+
+    write_record_atomic(&record, &paths)?;
+    Ok(record)
+}
+
+pub fn plan_nix_profile(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+    profile: Option<&Path>,
+) -> Result<ActivationRecord> {
+    let paths = ActivationPaths::from_env()?;
+    plan_nix_profile_with_paths(metadata, workspace, build_output, profile, &paths)
+}
+
+pub fn enable_nixos_module(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+) -> Result<ActivationRecord> {
+    enable_nix_module(metadata, workspace, build_output, "nixos-module")
+}
+
+pub fn plan_nixos_module(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+) -> Result<ActivationRecord> {
+    let paths = ActivationPaths::from_env()?;
+    plan_nix_module_with_paths(metadata, workspace, build_output, "nixos-module", &paths)
+}
+
+pub fn enable_home_manager_module(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+) -> Result<ActivationRecord> {
+    enable_nix_module(metadata, workspace, build_output, "home-manager-module")
+}
+
+pub fn plan_home_manager_module(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+) -> Result<ActivationRecord> {
+    let paths = ActivationPaths::from_env()?;
+    plan_nix_module_with_paths(
+        metadata,
+        workspace,
+        build_output,
+        "home-manager-module",
+        &paths,
+    )
+}
+
+fn enable_nix_module(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+    backend: &str,
+) -> Result<ActivationRecord> {
+    let paths = ActivationPaths::from_env()?;
+    let record = plan_nix_module_with_paths(metadata, workspace, build_output, backend, &paths)?;
+    let module = record
+        .modules
+        .first()
+        .ok_or_else(|| anyhow!("module activation record has no module entry"))?;
+
+    write_enabled_module_files(module, metadata, workspace)?;
+    write_record_atomic(&record, &paths)?;
+    Ok(record)
+}
+
+#[allow(dead_code)]
 pub fn enable_systemd_user_service(
     metadata: &Metadata,
     workspace: &Workspace,
@@ -160,6 +287,7 @@ pub fn enable_systemd_user_service(
     Ok(record)
 }
 
+#[allow(dead_code)]
 pub fn plan_systemd_user_service(
     metadata: &Metadata,
     workspace: &Workspace,
@@ -182,6 +310,7 @@ pub fn plan_systemd_user_service(
     )
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn plan_systemd_user_service_with_paths(
     metadata: &Metadata,
@@ -246,9 +375,106 @@ fn plan_systemd_user_service_with_paths(
             target: target.to_path_buf(),
             target_blake3: Some(blake3_file(target)?),
         }],
+        profiles: Vec::new(),
+        modules: Vec::new(),
     })
 }
 
+fn plan_nix_profile_with_paths(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+    profile: Option<&Path>,
+    paths: &ActivationPaths,
+) -> Result<ActivationRecord> {
+    let key = fork_key(metadata);
+    let package = fork_display_name(metadata);
+    for record_path in record_paths_for_metadata(metadata, paths) {
+        if record_path.exists() {
+            bail!("{package} is already active; run forkpkg disable first");
+        }
+    }
+
+    if !build_output.is_absolute() {
+        bail!("build output is not absolute: {}", build_output.display());
+    }
+    if !build_output.exists() {
+        bail!("build output does not exist: {}", build_output.display());
+    }
+
+    Ok(ActivationRecord {
+        format: 1,
+        key,
+        mode: "nix-profile".to_owned(),
+        package,
+        installable: metadata.package.installable.clone(),
+        workspace: workspace.root.clone(),
+        source: workspace.source.clone(),
+        build_output: build_output.to_path_buf(),
+        activated_at_unix: unix_time_secs()?,
+        links: Vec::new(),
+        services: Vec::new(),
+        profiles: vec![ProfileRecord {
+            profile: profile.map(Path::to_path_buf),
+            store_path: build_output.to_path_buf(),
+            element: None,
+            priority: 1,
+        }],
+        modules: Vec::new(),
+    })
+}
+
+fn plan_nix_module_with_paths(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+    backend: &str,
+    paths: &ActivationPaths,
+) -> Result<ActivationRecord> {
+    let key = fork_key(metadata);
+    let package = fork_display_name(metadata);
+    for record_path in record_paths_for_metadata(metadata, paths) {
+        if record_path.exists() {
+            bail!("{package} is already active; run forkpkg disable first");
+        }
+    }
+
+    if !build_output.is_absolute() {
+        bail!("build output is not absolute: {}", build_output.display());
+    }
+    if !build_output.exists() {
+        bail!("build output does not exist: {}", build_output.display());
+    }
+
+    let nix_dir = paths.activation_dir(&key).join("nix");
+    let module_name = match backend {
+        "nixos-module" => "nixos-module.nix",
+        "home-manager-module" => "home-manager-module.nix",
+        other => bail!("unsupported Nix module backend: {other}"),
+    };
+
+    Ok(ActivationRecord {
+        format: 1,
+        key,
+        mode: backend.to_owned(),
+        package,
+        installable: metadata.package.installable.clone(),
+        workspace: workspace.root.clone(),
+        source: workspace.source.clone(),
+        build_output: build_output.to_path_buf(),
+        activated_at_unix: unix_time_secs()?,
+        links: Vec::new(),
+        services: Vec::new(),
+        profiles: Vec::new(),
+        modules: vec![ModuleRecord {
+            backend: backend.to_owned(),
+            overlay: nix_dir.join("overlay.nix"),
+            module: nix_dir.join(module_name),
+        }],
+    })
+}
+
+#[allow(dead_code)]
 fn plan_path_shim_with_paths(
     metadata: &Metadata,
     workspace: &Workspace,
@@ -344,6 +570,8 @@ fn plan_path_shim_with_paths(
         activated_at_unix: unix_time_secs()?,
         links,
         services: Vec::new(),
+        profiles: Vec::new(),
+        modules: Vec::new(),
     })
 }
 
@@ -532,9 +760,48 @@ pub fn check_record(record: ActivationRecord) -> ActivationCheck {
         }
     }
 
+    for profile in &record.profiles {
+        match profile_contains_store_path(profile.profile.as_deref(), &profile.store_path) {
+            Ok(true) => {}
+            Ok(false) => problems.push(format!(
+                "Nix profile does not contain {}",
+                profile.store_path.display()
+            )),
+            Err(error) => problems.push(format!("failed to inspect Nix profile: {error:#}")),
+        }
+    }
+
+    for module in &record.modules {
+        if !module.overlay.is_file() {
+            problems.push(format!(
+                "Nix overlay is missing: {}",
+                module.overlay.display()
+            ));
+        }
+        if !module.module.is_file() {
+            problems.push(format!(
+                "Nix module is missing: {}",
+                module.module.display()
+            ));
+        } else {
+            match fs::read_to_string(&module.module) {
+                Ok(text) if text.contains("forkpkg: enabled") => {}
+                Ok(_) => problems.push(format!(
+                    "Nix module is not marked enabled: {}",
+                    module.module.display()
+                )),
+                Err(error) => problems.push(format!(
+                    "failed to read Nix module {}: {error}",
+                    module.module.display()
+                )),
+            }
+        }
+    }
+
     ActivationCheck { record, problems }
 }
 
+#[allow(dead_code)]
 fn apply_enable_record(record: &ActivationRecord, paths: &ActivationPaths) -> Result<()> {
     preflight_enable_record(record, paths)?;
 
@@ -550,6 +817,7 @@ fn apply_enable_record(record: &ActivationRecord, paths: &ActivationPaths) -> Re
     Ok(())
 }
 
+#[allow(dead_code)]
 fn try_apply_enable_record(
     record: &ActivationRecord,
     paths: &ActivationPaths,
@@ -620,6 +888,7 @@ fn try_apply_enable_record(
     write_record_atomic(record, paths)
 }
 
+#[allow(dead_code)]
 fn preflight_enable_record(record: &ActivationRecord, paths: &ActivationPaths) -> Result<()> {
     let record_path = paths.record_path(record);
     if record_path.exists() {
@@ -737,6 +1006,27 @@ fn try_apply_disable_record(
         systemctl_user(["restart", service.service.as_str()])?;
     }
 
+    for profile in &record.profiles {
+        if profile_contains_store_path(profile.profile.as_deref(), &profile.store_path)? {
+            nix_profile_remove(profile.profile.as_deref(), &profile.store_path)?;
+            undo.push(DisableUndo::ReinstallProfile {
+                profile: profile.profile.clone(),
+                store_path: profile.store_path.clone(),
+                priority: profile.priority,
+            });
+        }
+    }
+
+    for module in &record.modules {
+        let previous_text = fs::read_to_string(&module.module)
+            .with_context(|| format!("failed to read Nix module {}", module.module.display()))?;
+        write_disabled_module_file(module)?;
+        undo.push(DisableUndo::RestoreModule {
+            module: module.module.clone(),
+            text: previous_text,
+        });
+    }
+
     let record_path = paths.record_path(record);
     fs::remove_file(&record_path)
         .with_context(|| format!("failed to remove {}", record_path.display()))?;
@@ -825,6 +1115,7 @@ pub fn package_display_name(metadata: &Metadata) -> String {
         .unwrap_or_else(|| metadata.package.attribute.clone())
 }
 
+#[allow(dead_code)]
 pub fn path_hint() -> Result<Option<String>> {
     let user_bin = user_bin_dir()?;
     let user_bin = user_bin
@@ -839,6 +1130,7 @@ pub fn path_hint() -> Result<Option<String>> {
     })
 }
 
+#[allow(dead_code)]
 fn executable_entries(bin_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = Vec::new();
     for entry in
@@ -965,6 +1257,201 @@ fn ensure_target_path_is_unchanged(path: &Path, expected_hash: Option<&String>) 
     Ok(())
 }
 
+fn write_enabled_module_files(
+    module: &ModuleRecord,
+    metadata: &Metadata,
+    workspace: &Workspace,
+) -> Result<()> {
+    let overlay = nix::local_source_overlay_expr(metadata, &workspace.source)?;
+    write_text_atomic(&module.overlay, &overlay)?;
+    write_text_atomic(&module.module, &enabled_module_text(module))?;
+    Ok(())
+}
+
+fn write_disabled_module_file(module: &ModuleRecord) -> Result<()> {
+    write_text_atomic(&module.module, &disabled_module_text(module))
+}
+
+fn enabled_module_text(module: &ModuleRecord) -> String {
+    format!(
+        "\
+# forkpkg: enabled
+{{ ... }}:
+{{
+  nixpkgs.overlays = [ (import {}) ];
+}}
+",
+        nix_path_literal(&module.overlay)
+    )
+}
+
+fn disabled_module_text(module: &ModuleRecord) -> String {
+    format!(
+        "\
+# forkpkg: disabled
+{{ ... }}:
+{{
+}}
+# Previous backend: {}
+",
+        module.backend
+    )
+}
+
+fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let temporary = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("forkpkg"),
+        std::process::id(),
+        unix_time_secs()?
+    ));
+
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temporary.display()))?;
+        fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                temporary.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+
+    write_result
+}
+
+fn nix_path_literal(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    format!("(/. + {})", nix_string(&path))
+}
+
+fn nix_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[derive(Debug, Deserialize)]
+struct NixProfileList {
+    elements: BTreeMap<String, NixProfileElement>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NixProfileElement {
+    #[serde(default)]
+    active: bool,
+    #[serde(default, rename = "storePaths")]
+    store_paths: Vec<PathBuf>,
+}
+
+pub fn profile_contains_store_path(profile: Option<&Path>, store_path: &Path) -> Result<bool> {
+    Ok(find_profile_element(profile, store_path)?.is_some())
+}
+
+fn find_profile_element(profile: Option<&Path>, store_path: &Path) -> Result<Option<String>> {
+    let list = nix_profile_list(profile)?;
+    Ok(list.elements.into_iter().find_map(|(name, element)| {
+        (element.active && element.store_paths.iter().any(|path| path == store_path))
+            .then_some(name)
+    }))
+}
+
+fn nix_profile_add(profile: Option<&Path>, store_path: &Path, priority: i64) -> Result<()> {
+    let priority = priority.to_string();
+    let mut command = nix_command();
+    command.args(["profile", "add", "--priority", &priority]);
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    command.arg(store_path);
+    run_command(&mut command, "nix profile add")
+}
+
+fn nix_profile_remove(profile: Option<&Path>, store_path: &Path) -> Result<()> {
+    let mut command = nix_command();
+    command.args(["profile", "remove"]);
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    command.arg(store_path);
+    run_command(&mut command, "nix profile remove")
+}
+
+fn nix_profile_list(profile: Option<&Path>) -> Result<NixProfileList> {
+    let mut command = nix_command();
+    command.args(["profile", "list", "--json"]);
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+
+    let output = command
+        .output()
+        .context("failed to execute nix profile list")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "nix profile list failed with status {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    serde_json::from_slice(&output.stdout).context("failed to parse nix profile JSON")
+}
+
+fn nix_command() -> Command {
+    let mut command = Command::new("nix");
+    command.args(["--extra-experimental-features", "nix-command flakes"]);
+    command
+}
+
+fn run_command(command: &mut Command, label: &str) -> Result<()> {
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute {label}"))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{label} failed with status {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn write_service_override_atomic(service: &ServiceRecord) -> Result<()> {
     let parent = service.override_path.parent().ok_or_else(|| {
         anyhow!(
@@ -1128,6 +1615,7 @@ fn link_exists(path: &Path) -> Result<bool> {
     }
 }
 
+#[allow(dead_code)]
 fn is_plain_directory(path: &Path) -> Result<bool> {
     Ok(fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?
@@ -1151,6 +1639,7 @@ fn unix_time_secs() -> Result<u64> {
         .as_secs())
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum EnableUndo {
     RemoveCreated {
@@ -1166,6 +1655,7 @@ enum EnableUndo {
     },
 }
 
+#[allow(dead_code)]
 fn rollback_enable(mut undo: Vec<EnableUndo>) -> Result<()> {
     let mut errors = Vec::new();
     while let Some(action) = undo.pop() {
@@ -1237,6 +1727,15 @@ enum DisableUndo {
         override_path: PathBuf,
         text: String,
     },
+    ReinstallProfile {
+        profile: Option<PathBuf>,
+        store_path: PathBuf,
+        priority: i64,
+    },
+    RestoreModule {
+        module: PathBuf,
+        text: String,
+    },
 }
 
 fn rollback_disable(mut undo: Vec<DisableUndo>) -> Result<()> {
@@ -1291,6 +1790,12 @@ fn rollback_disable(mut undo: Vec<DisableUndo>) -> Result<()> {
                 let _ = systemctl_user(["restart", service.as_str()]);
                 Ok(())
             }
+            DisableUndo::ReinstallProfile {
+                profile,
+                store_path,
+                priority,
+            } => nix_profile_add(profile.as_deref(), &store_path, priority),
+            DisableUndo::RestoreModule { module, text } => write_text_atomic(&module, &text),
         };
 
         if let Err(error) = result {

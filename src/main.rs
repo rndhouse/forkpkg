@@ -7,14 +7,14 @@ mod sharing;
 mod targets;
 mod workspace;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Serialize;
 
 use crate::activation::{ActivationRecordEntry, PreviousLink};
-use crate::cli::{Cli, Command};
+use crate::cli::{ActivationBackend, Cli, Command};
 use crate::metadata::{BaseMetadata, BuildMetadata, ForkMetadata, Metadata, PackageMetadata};
 
 fn main() {
@@ -37,14 +37,11 @@ fn run() -> Result<()> {
         Command::Targets { path, json } => targets(path, json),
         Command::Enable {
             path,
-            target,
+            backend,
+            profile,
             dry_run,
-        } => enable(path, target.as_deref(), dry_run),
-        Command::Disable {
-            path,
-            target,
-            dry_run,
-        } => disable(path, target.as_deref(), dry_run),
+        } => enable(path, backend, profile, dry_run),
+        Command::Disable { path, dry_run } => disable(path, dry_run),
         Command::DisableAll { dry_run } => disable_all(dry_run),
         Command::Doctor => doctor(),
         Command::Status { path } => status(path),
@@ -208,6 +205,40 @@ struct ForkGitState {
     head_commit: String,
     commits_on_top: Option<u64>,
     dirty: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct BackendReport {
+    output: PathBuf,
+    backends: Vec<BackendEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct BackendEntry {
+    id: String,
+    kind: String,
+    confidence: String,
+    supported: bool,
+    active: bool,
+    evidence: Vec<String>,
+    details: BackendDetails,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BackendDetails {
+    NixProfile {
+        profile: Option<PathBuf>,
+        profile_contains_output: bool,
+    },
+    NixosModule {
+        module: Option<PathBuf>,
+        overlay: Option<PathBuf>,
+    },
+    HomeManagerModule {
+        module: Option<PathBuf>,
+        overlay: Option<PathBuf>,
+    },
 }
 
 fn list(json: bool) -> Result<()> {
@@ -407,8 +438,7 @@ fn targets(path: Option<PathBuf>, json: bool) -> Result<()> {
     let workspace = workspace::resolve(path)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let output = nix::build_local_source(&metadata, &workspace.source)?;
-    let mut report = targets::discover(&output)?;
-    mark_active_targets(&metadata, &mut report)?;
+    let report = discover_backends(&metadata, &output)?;
 
     if json {
         println!(
@@ -419,75 +449,48 @@ fn targets(path: Option<PathBuf>, json: bool) -> Result<()> {
     }
 
     println!("output: {}", report.output.display());
-    if report.targets.is_empty() {
-        println!("no activation targets found");
+    if report.backends.is_empty() {
+        println!("no Nix activation backends found");
         return Ok(());
     }
 
-    for target in &report.targets {
+    for backend in &report.backends {
         println!(
             "{} kind:{} confidence:{} supported:{} active:{}",
-            target.id,
-            target.kind,
-            target.confidence,
-            yes_no(target.supported),
-            yes_no(target.active),
+            backend.id,
+            backend.kind,
+            backend.confidence,
+            yes_no(backend.supported),
+            yes_no(backend.active),
         );
-        match &target.details {
-            targets::TargetDetails::PathShim {
-                executables,
-                path_matches,
+        match &backend.details {
+            BackendDetails::NixProfile {
+                profile,
+                profile_contains_output,
             } => {
-                for executable in executables {
-                    println!("  executable: {}", executable.display());
-                }
-                for path_match in path_matches {
-                    println!(
-                        "  path_match: {} resolved:{} points_to_output:{}",
-                        path_match.path.display(),
-                        path_match
-                            .resolved
-                            .as_ref()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "-".to_owned()),
-                        yes_no(path_match.points_to_output),
-                    );
-                }
+                println!(
+                    "  profile: {}",
+                    profile
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "default".to_owned())
+                );
+                println!(
+                    "  profile_contains_output: {}",
+                    yes_no(*profile_contains_output)
+                );
             }
-            targets::TargetDetails::SystemdUserService {
-                service,
-                service_file,
-                exec_start,
-                executable,
-                dbus_names,
-            } => {
-                println!("  service: {service}");
-                println!("  service_file: {}", service_file.display());
-                println!("  exec_start: {exec_start}");
-                if let Some(executable) = executable {
-                    println!("  executable: {}", executable.display());
+            BackendDetails::NixosModule { module, overlay }
+            | BackendDetails::HomeManagerModule { module, overlay } => {
+                if let Some(module) = module {
+                    println!("  module: {}", module.display());
                 }
-                for dbus_name in dbus_names {
-                    println!("  dbus_name: {dbus_name}");
-                }
-            }
-            targets::TargetDetails::DbusService {
-                name,
-                service_file,
-                exec,
-                systemd_service,
-            } => {
-                println!("  name: {name}");
-                println!("  service_file: {}", service_file.display());
-                if let Some(exec) = exec {
-                    println!("  exec: {exec}");
-                }
-                if let Some(systemd_service) = systemd_service {
-                    println!("  systemd_service: {systemd_service}");
+                if let Some(overlay) = overlay {
+                    println!("  overlay: {}", overlay.display());
                 }
             }
         }
-        for evidence in &target.evidence {
+        for evidence in &backend.evidence {
             println!("  evidence: {evidence}");
         }
     }
@@ -495,7 +498,12 @@ fn targets(path: Option<PathBuf>, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn enable(path: Option<PathBuf>, requested_target: Option<&str>, dry_run: bool) -> Result<()> {
+fn enable(
+    path: Option<PathBuf>,
+    requested_backend: ActivationBackend,
+    profile: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
     let workspace = workspace::resolve(path)?;
     let metadata = Metadata::read(&workspace.metadata)?;
 
@@ -505,29 +513,32 @@ fn enable(path: Option<PathBuf>, requested_target: Option<&str>, dry_run: bool) 
         eprintln!("building fork before activation");
     }
     let output = nix::build_local_source(&metadata, &workspace.source)?;
-    let mut report = targets::discover(&output)?;
-    mark_active_targets(&metadata, &mut report)?;
-    let target = select_target(&report, requested_target)?;
+    let backend = select_backend(requested_backend, &output)?;
 
-    match target.kind.as_str() {
-        "path-shim" => enable_path_shim_target(&metadata, &workspace, &output, dry_run),
-        "systemd-user-service" => {
-            enable_systemd_user_target(&metadata, &workspace, &output, target, dry_run)
-        }
-        other => anyhow::bail!("activation target kind is not supported yet: {other}"),
+    if profile.is_some() && backend != ActivationBackend::NixProfile {
+        anyhow::bail!("--profile only applies to --backend nix-profile");
     }
-}
 
-fn enable_path_shim_target(
-    metadata: &Metadata,
-    workspace: &workspace::Workspace,
-    output: &std::path::Path,
-    dry_run: bool,
-) -> Result<()> {
-    let record = if dry_run {
-        activation::plan_path_shim(metadata, workspace, output)?
-    } else {
-        activation::enable_path_shim(metadata, workspace, output)?
+    let record = match backend {
+        ActivationBackend::Auto => unreachable!("auto backend should be resolved"),
+        ActivationBackend::NixProfile if dry_run => {
+            activation::plan_nix_profile(&metadata, &workspace, &output, profile.as_deref())?
+        }
+        ActivationBackend::NixProfile => {
+            activation::enable_nix_profile(&metadata, &workspace, &output, profile.as_deref())?
+        }
+        ActivationBackend::NixosModule if dry_run => {
+            activation::plan_nixos_module(&metadata, &workspace, &output)?
+        }
+        ActivationBackend::NixosModule => {
+            activation::enable_nixos_module(&metadata, &workspace, &output)?
+        }
+        ActivationBackend::HomeManagerModule if dry_run => {
+            activation::plan_home_manager_module(&metadata, &workspace, &output)?
+        }
+        ActivationBackend::HomeManagerModule => {
+            activation::enable_home_manager_module(&metadata, &workspace, &output)?
+        }
     };
 
     if dry_run {
@@ -537,106 +548,16 @@ fn enable_path_shim_target(
     }
     println!("mode: {}", record.mode);
     println!("output: {}", record.build_output.display());
-    for link in &record.links {
-        match &link.previous {
-            PreviousLink::Absent => {
-                if dry_run {
-                    println!(
-                        "would create: {} -> {}",
-                        link.link.display(),
-                        link.target.display()
-                    );
-                    print_target_blake3(link);
-                    println!("previous: absent");
-                } else {
-                    println!("link: {} -> {}", link.link.display(), link.target.display());
-                    print_target_blake3(link);
-                }
-            }
-            PreviousLink::BackedUp { backup } => {
-                if dry_run {
-                    println!("would move existing: {}", link.link.display());
-                    println!("backup: {}", backup.display());
-                    println!(
-                        "would create: {} -> {}",
-                        link.link.display(),
-                        link.target.display()
-                    );
-                    print_target_blake3(link);
-                } else {
-                    println!("link: {} -> {}", link.link.display(), link.target.display());
-                    print_target_blake3(link);
-                    println!("previous backup: {}", backup.display());
-                }
-            }
-        }
-    }
-    if let Some(hint) = activation::path_hint()? {
-        println!("warning: {hint}");
-    }
+    print_profile_records(&record, dry_run);
+    print_module_records(&record, dry_run);
 
     Ok(())
 }
 
-fn enable_systemd_user_target(
-    metadata: &Metadata,
-    workspace: &workspace::Workspace,
-    output: &std::path::Path,
-    target: &targets::ActivationTarget,
-    dry_run: bool,
-) -> Result<()> {
-    let spec = targets::systemd_user_service_spec(target)?;
-    let executable = spec
-        .executable
-        .as_ref()
-        .context("systemd user service target has no absolute executable")?;
-
-    if !executable.starts_with(output) {
-        anyhow::bail!(
-            "refusing service activation because target executable is outside the forked output: {}",
-            executable.display()
-        );
-    }
-
-    let record = if dry_run {
-        activation::plan_systemd_user_service(
-            metadata,
-            workspace,
-            output,
-            &spec.service,
-            &spec.service_file,
-            &spec.exec_start,
-            executable,
-        )?
-    } else {
-        activation::enable_systemd_user_service(
-            metadata,
-            workspace,
-            output,
-            &spec.service,
-            &spec.service_file,
-            &spec.exec_start,
-            executable,
-        )?
-    };
-
-    if dry_run {
-        println!("would enable: {}", target.id);
-    } else {
-        println!("enabled: {}", target.id);
-    }
-    println!("mode: {}", record.mode);
-    println!("output: {}", record.build_output.display());
-    print_service_records(&record, dry_run);
-
-    Ok(())
-}
-
-fn disable(path: Option<PathBuf>, requested_target: Option<&str>, dry_run: bool) -> Result<()> {
+fn disable(path: Option<PathBuf>, dry_run: bool) -> Result<()> {
     let workspace = workspace::resolve(path)?;
     let metadata = Metadata::read(&workspace.metadata)?;
     let record = activation::disable_plan(&metadata)?;
-    ensure_record_matches_requested_target(&record, requested_target)?;
     if !dry_run {
         activation::disable_record(&record)?;
     }
@@ -671,6 +592,8 @@ fn disable(path: Option<PathBuf>, requested_target: Option<&str>, dry_run: bool)
         }
     }
     print_service_records(&record, dry_run);
+    print_profile_records(&record, dry_run);
+    print_module_records(&record, dry_run);
 
     Ok(())
 }
@@ -794,6 +717,21 @@ fn doctor() -> Result<()> {
                             None => println!("  target_blake3: missing verified:no"),
                         }
                     }
+                    for profile in &check.record.profiles {
+                        println!(
+                            "  profile: {} store_path:{}",
+                            profile_display(profile.profile.as_ref()),
+                            profile.store_path.display()
+                        );
+                    }
+                    for module in &check.record.modules {
+                        println!(
+                            "  module: {} backend:{} overlay:{}",
+                            module.module.display(),
+                            module.backend,
+                            module.overlay.display()
+                        );
+                    }
                 } else {
                     problems += check.problems.len();
                     println!("activation: {} status:broken", check.record.package);
@@ -877,6 +815,19 @@ fn status(path: Option<PathBuf>) -> Result<()> {
                     None => println!("target_blake3: missing"),
                 }
             }
+            for profile in &record.profiles {
+                println!("profile: {}", profile_display(profile.profile.as_ref()));
+                println!("profile_store_path: {}", profile.store_path.display());
+                if let Some(element) = &profile.element {
+                    println!("profile_element: {element}");
+                }
+                println!("profile_priority: {}", profile.priority);
+            }
+            for module in &record.modules {
+                println!("module_backend: {}", module.backend);
+                println!("module: {}", module.module.display());
+                println!("overlay: {}", module.overlay.display());
+            }
         }
         None => {
             println!("fork: {reference}");
@@ -925,6 +876,8 @@ fn print_disable_record_links(record: &activation::ActivationRecord, dry_run: bo
         }
     }
     print_service_records(record, dry_run);
+    print_profile_records(record, dry_run);
+    print_module_records(record, dry_run);
 }
 
 fn print_service_records(record: &activation::ActivationRecord, dry_run: bool) {
@@ -947,32 +900,39 @@ fn print_service_records(record: &activation::ActivationRecord, dry_run: bool) {
     }
 }
 
-fn mark_active_targets(metadata: &Metadata, report: &mut targets::TargetReport) -> Result<()> {
-    let Some(record) = activation::status(metadata)? else {
-        return Ok(());
-    };
-    let active_target_ids = record_target_ids(&record);
-    for target in &mut report.targets {
-        target.active = active_target_ids.iter().any(|id| id == &target.id);
+fn print_profile_records(record: &activation::ActivationRecord, _dry_run: bool) {
+    for profile in &record.profiles {
+        println!("profile: {}", profile_display(profile.profile.as_ref()));
+        println!("profile_store_path: {}", profile.store_path.display());
+        if let Some(element) = &profile.element {
+            println!("profile_element: {element}");
+        }
+        println!("profile_priority: {}", profile.priority);
     }
-    Ok(())
 }
 
-fn ensure_record_matches_requested_target(
-    record: &activation::ActivationRecord,
-    requested_target: Option<&str>,
-) -> Result<()> {
-    let Some(requested_target) = requested_target else {
-        return Ok(());
-    };
-    let target_ids = record_target_ids(record);
-    if target_ids.iter().any(|id| id == requested_target) {
-        return Ok(());
+fn print_module_records(record: &activation::ActivationRecord, dry_run: bool) {
+    for module in &record.modules {
+        if dry_run {
+            println!("would write module: {}", module.module.display());
+            println!("would write overlay: {}", module.overlay.display());
+        } else {
+            println!("module_backend: {}", module.backend);
+            println!("module: {}", module.module.display());
+            println!("overlay: {}", module.overlay.display());
+        }
+        match module.backend.as_str() {
+            "nixos-module" => {
+                println!("next: import module in NixOS config, then run nixos-rebuild switch");
+            }
+            "home-manager-module" => {
+                println!(
+                    "next: import module in Home Manager config, then run home-manager switch"
+                );
+            }
+            _ => {}
+        }
     }
-    anyhow::bail!(
-        "active record target mismatch; active target(s): {}",
-        target_ids.join(", ")
-    )
 }
 
 fn record_target_ids(record: &activation::ActivationRecord) -> Vec<String> {
@@ -983,39 +943,183 @@ fn record_target_ids(record: &activation::ActivationRecord) -> Vec<String> {
     for service in &record.services {
         ids.push(format!("systemd-user:{}", service.service));
     }
+    if !record.profiles.is_empty() {
+        ids.push("nix-profile".to_owned());
+    }
+    for module in &record.modules {
+        ids.push(module.backend.clone());
+    }
     ids
 }
 
-fn select_target<'a>(
-    report: &'a targets::TargetReport,
-    requested_target: Option<&str>,
-) -> Result<&'a targets::ActivationTarget> {
-    if let Some(requested_target) = requested_target {
-        return report
-            .targets
-            .iter()
-            .find(|target| target.id == requested_target)
-            .with_context(|| format!("activation target not found: {requested_target}"));
+fn select_backend(requested: ActivationBackend, output: &Path) -> Result<ActivationBackend> {
+    if requested != ActivationBackend::Auto {
+        return Ok(requested);
     }
 
-    let supported = report
-        .targets
-        .iter()
-        .filter(|target| target.supported)
-        .collect::<Vec<_>>();
+    if is_nixos() && output_looks_service_managed(output)? {
+        return Ok(ActivationBackend::NixosModule);
+    }
 
-    match supported.as_slice() {
-        [target] => Ok(*target),
-        [] => anyhow::bail!("no supported activation target found; run forkpkg targets first"),
-        _ => {
-            let ids = supported
-                .iter()
-                .map(|target| target.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!("multiple activation targets found ({ids}); rerun with --target <id>")
+    Ok(ActivationBackend::NixProfile)
+}
+
+fn discover_backends(metadata: &Metadata, output: &Path) -> Result<BackendReport> {
+    let active = activation::status(metadata)?;
+    let active_mode = active.as_ref().map(|record| record.mode.as_str());
+    let service_managed = output_looks_service_managed(output)?;
+    let has_profile_files = output.join("bin").is_dir()
+        || output.join("share/applications").is_dir()
+        || output.join("share").is_dir();
+    let profile_contains_output =
+        activation::profile_contains_store_path(None, output).unwrap_or(false);
+
+    let mut backends = Vec::new();
+    let mut profile_evidence = vec![
+        "Nix profile can install the built store output directly".to_owned(),
+        "Nix owns the profile symlink tree and profile generations".to_owned(),
+    ];
+    if has_profile_files {
+        profile_evidence.push("output contains files that profiles normally expose".to_owned());
+    } else {
+        profile_evidence.push("output has no obvious profile-facing bin/share files".to_owned());
+    }
+    if service_managed {
+        profile_evidence
+            .push("service-like outputs may need a NixOS/Home Manager module instead".to_owned());
+    }
+    backends.push(BackendEntry {
+        id: "nix-profile".to_owned(),
+        kind: "nix-profile".to_owned(),
+        confidence: if service_managed {
+            "low"
+        } else if has_profile_files {
+            "high"
+        } else {
+            "medium"
         }
+        .to_owned(),
+        supported: true,
+        active: active_mode == Some("nix-profile") || profile_contains_output,
+        evidence: profile_evidence,
+        details: BackendDetails::NixProfile {
+            profile: None,
+            profile_contains_output,
+        },
+    });
+
+    let nixos_supported = is_nixos();
+    let mut nixos_evidence = vec![
+        "generated module adds a nixpkgs overlay for the forked package".to_owned(),
+        "NixOS activation happens through the user's normal nixos-rebuild switch".to_owned(),
+    ];
+    if service_managed {
+        nixos_evidence.push("output contains service or D-Bus activation files".to_owned());
     }
+    if !nixos_supported {
+        nixos_evidence.push("this machine does not look like NixOS".to_owned());
+    }
+    let (nixos_module, nixos_overlay) = active
+        .as_ref()
+        .and_then(|record| {
+            record
+                .modules
+                .iter()
+                .find(|module| module.backend == "nixos-module")
+        })
+        .map(|module| (Some(module.module.clone()), Some(module.overlay.clone())))
+        .unwrap_or((None, None));
+    backends.push(BackendEntry {
+        id: "nixos-module".to_owned(),
+        kind: "nixos-module".to_owned(),
+        confidence: if nixos_supported && service_managed {
+            "high"
+        } else if nixos_supported {
+            "medium"
+        } else {
+            "low"
+        }
+        .to_owned(),
+        supported: nixos_supported,
+        active: active_mode == Some("nixos-module"),
+        evidence: nixos_evidence,
+        details: BackendDetails::NixosModule {
+            module: nixos_module,
+            overlay: nixos_overlay,
+        },
+    });
+
+    let home_manager_supported = command_exists("home-manager");
+    let mut home_evidence = vec![
+        "generated module adds a nixpkgs overlay for Home Manager evaluation".to_owned(),
+        "activation happens through the user's normal home-manager switch".to_owned(),
+    ];
+    if !home_manager_supported {
+        home_evidence.push("home-manager command was not found in PATH".to_owned());
+    }
+    let (home_module, home_overlay) = active
+        .as_ref()
+        .and_then(|record| {
+            record
+                .modules
+                .iter()
+                .find(|module| module.backend == "home-manager-module")
+        })
+        .map(|module| (Some(module.module.clone()), Some(module.overlay.clone())))
+        .unwrap_or((None, None));
+    backends.push(BackendEntry {
+        id: "home-manager-module".to_owned(),
+        kind: "home-manager-module".to_owned(),
+        confidence: if home_manager_supported {
+            "medium"
+        } else {
+            "low"
+        }
+        .to_owned(),
+        supported: home_manager_supported,
+        active: active_mode == Some("home-manager-module"),
+        evidence: home_evidence,
+        details: BackendDetails::HomeManagerModule {
+            module: home_module,
+            overlay: home_overlay,
+        },
+    });
+
+    Ok(BackendReport {
+        output: output.to_path_buf(),
+        backends,
+    })
+}
+
+fn output_looks_service_managed(output: &Path) -> Result<bool> {
+    let report = targets::discover(output)?;
+    Ok(report.targets.iter().any(|target| {
+        matches!(
+            target.details,
+            targets::TargetDetails::SystemdUserService { .. }
+                | targets::TargetDetails::DbusService { .. }
+        )
+    }))
+}
+
+fn is_nixos() -> bool {
+    Path::new("/run/current-system").exists() || Path::new("/etc/NIXOS").exists()
+}
+
+fn command_exists(name: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v \"$1\" >/dev/null 2>&1")
+        .arg("sh")
+        .arg(name)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn profile_display(profile: Option<&PathBuf>) -> String {
+    profile
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "default".to_owned())
 }
 
 fn fork_label_or_default(

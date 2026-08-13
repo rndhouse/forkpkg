@@ -142,6 +142,36 @@ pub fn build_local_source(metadata: &Metadata, source_path: &Path) -> Result<Pat
     nix_build_expr(&expr).context("failed to build local fork")
 }
 
+pub fn local_source_overlay_expr(metadata: &Metadata, source_path: &Path) -> Result<String> {
+    let installable = installable_from_metadata(metadata)?;
+    let source = local_source_expr(metadata, source_path)?;
+    let overlay_attrs = overlay_attr_set(&installable.attr_path, "forkedPackage")?;
+
+    Ok(format!(
+        r#"
+final: prev:
+let
+  lib = prev.lib;
+  attrPath = {attr_path};
+  package = lib.attrByPath attrPath (throw {attribute_message}) prev;
+  localSource = {source};
+  forkedPackage = package.overrideAttrs (old: {{
+    src = localSource;
+    patches = [];
+    prePatch = "";
+    postPatch = "";
+    patchPhase = "runHook prePatch\nrunHook postPatch\n";
+    unpackPhase = "runHook preUnpack\ncp -a --reflink=auto \"$src\" source\nchmod -R u+w source\nsourceRoot=source\nrunHook postUnpack\n";
+  }});
+in
+{overlay_attrs}
+"#,
+        attr_path = nix_string_list(&installable.attr_path),
+        attribute_message = attribute_message(&installable.attribute),
+        source = source,
+    ))
+}
+
 pub fn path_info(path: &str) -> Result<Option<StorePathInfo>> {
     let value: BTreeMap<String, Option<PathInfoEntry>> =
         nix_json(&["path-info", "--json"], &[path.to_owned()])?;
@@ -231,23 +261,56 @@ in
 }
 
 fn build_expr(metadata: &Metadata, source_path: &Path) -> Result<String> {
-    let installable = Installable {
-        original: metadata.package.installable.clone(),
-        flake_ref: metadata.package.flake_ref.clone(),
-        attribute: metadata.package.attribute.clone(),
-        attr_path: metadata
-            .package
-            .attribute
-            .split('.')
-            .filter(|part| !part.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-    };
+    let installable = installable_from_metadata(metadata)?;
+    let source = local_source_expr(metadata, source_path)?;
 
-    if installable.attr_path.is_empty() {
+    Ok(format!(
+        r#"
+let
+  flake = builtins.getFlake {flake_ref};
+  pkgs = flake.legacyPackages.${{{system}}};
+  lib = pkgs.lib;
+  pkg = lib.attrByPath {attr_path} (throw {attribute_message}) pkgs;
+  localSource = {source};
+in
+  pkg.overrideAttrs (old: {{
+    src = localSource;
+    patches = [];
+    prePatch = "";
+    postPatch = "";
+    patchPhase = "runHook prePatch\nrunHook postPatch\n";
+    unpackPhase = "runHook preUnpack\ncp -a --reflink=auto \"$src\" source\nchmod -R u+w source\nsourceRoot=source\nrunHook postUnpack\n";
+  }})
+"#,
+        flake_ref = nix_string(&installable.flake_ref),
+        system = nix_string(&metadata.package.system),
+        attr_path = nix_string_list(&installable.attr_path),
+        attribute_message = attribute_message(&installable.attribute),
+    ))
+}
+
+fn installable_from_metadata(metadata: &Metadata) -> Result<Installable> {
+    let attr_path = metadata
+        .package
+        .attribute
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if attr_path.is_empty() {
         bail!("metadata package attribute is empty");
     }
 
+    Ok(Installable {
+        original: metadata.package.installable.clone(),
+        flake_ref: metadata.package.flake_ref.clone(),
+        attribute: metadata.package.attribute.clone(),
+        attr_path,
+    })
+}
+
+fn local_source_expr(metadata: &Metadata, source_path: &Path) -> Result<String> {
     let source_path = source_path
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", source_path.display()))?;
@@ -265,34 +328,36 @@ fn build_expr(metadata: &Metadata, source_path: &Path) -> Result<String> {
     );
 
     Ok(format!(
-        r#"
-let
-  flake = builtins.getFlake {flake_ref};
-  pkgs = flake.legacyPackages.${{{system}}};
-  lib = pkgs.lib;
-  pkg = lib.attrByPath {attr_path} (throw {attribute_message}) pkgs;
-  localSource = builtins.path {{
+        r#"builtins.path {{
     path = {source_path};
     name = {local_name};
     filter = path: type: baseNameOf path != ".git";
-  }};
-in
-  pkg.overrideAttrs (old: {{
-    src = localSource;
-    patches = [];
-    prePatch = "";
-    postPatch = "";
-    patchPhase = "runHook prePatch\nrunHook postPatch\n";
-    unpackPhase = "runHook preUnpack\ncp -a --reflink=auto \"$src\" source\nchmod -R u+w source\nsourceRoot=source\nrunHook postUnpack\n";
-  }})
-"#,
-        flake_ref = nix_string(&installable.flake_ref),
-        system = nix_string(&metadata.package.system),
-        attr_path = nix_string_list(&installable.attr_path),
-        attribute_message = attribute_message(&installable.attribute),
+  }}"#,
         source_path = nix_string(source_string),
         local_name = nix_string(&local_name),
     ))
+}
+
+fn overlay_attr_set(attr_path: &[String], value: &str) -> Result<String> {
+    if attr_path.is_empty() {
+        bail!("metadata package attribute is empty");
+    }
+    Ok(overlay_attr_set_at(attr_path, value, "prev", 0))
+}
+
+fn overlay_attr_set_at(attr_path: &[String], value: &str, previous: &str, depth: usize) -> String {
+    let indent = "  ".repeat(depth);
+    let field = nix_string(&attr_path[0]);
+    if attr_path.len() == 1 {
+        return format!("{}{{\n{}  {field} = {value};\n{}}}", indent, indent, indent);
+    }
+
+    let current = format!("{previous}.{field}");
+    let nested = overlay_attr_set_at(&attr_path[1..], value, &current, depth + 1);
+    format!(
+        "{}{{\n{}  {field} = ({current} or {{}}) //\n{nested};\n{}}}",
+        indent, indent, indent
+    )
 }
 
 fn nix_build_expr(expr: &str) -> Result<PathBuf> {
@@ -391,7 +456,7 @@ fn u64_at(value: &Value, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attribute_message, nix_string, parse_installable};
+    use super::{attribute_message, nix_string, overlay_attr_set, parse_installable};
 
     #[test]
     fn parses_simple_nixpkgs_installable() {
@@ -428,5 +493,17 @@ mod tests {
             attribute_message("bad\"pkg"),
             "\"package attribute not found: bad\\\"pkg\""
         );
+    }
+
+    #[test]
+    fn overlay_attr_sets_preserve_nested_package_sets() {
+        let attr_set = overlay_attr_set(
+            &["gnome".to_owned(), "xdg-desktop-portal-gnome".to_owned()],
+            "forkedPackage",
+        )
+        .unwrap();
+
+        assert!(attr_set.contains("\"gnome\" = (prev.\"gnome\" or {}) //"));
+        assert!(attr_set.contains("\"xdg-desktop-portal-gnome\" = forkedPackage;"));
     }
 }

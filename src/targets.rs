@@ -54,6 +54,7 @@ pub struct PathMatch {
     pub points_to_output: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SystemdUserServiceSpec {
     pub service: String,
@@ -131,6 +132,7 @@ fn dedupe_targets(targets: Vec<ActivationTarget>) -> Vec<ActivationTarget> {
     deduped
 }
 
+#[allow(dead_code)]
 pub fn systemd_user_service_spec(target: &ActivationTarget) -> Result<SystemdUserServiceSpec> {
     let TargetDetails::SystemdUserService {
         service,

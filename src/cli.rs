@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "forkpkg")]
@@ -82,9 +82,13 @@ pub enum Command {
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
 
-        /// Activation target id, for example path-shim or systemd-user:name.service.
-        #[arg(long)]
-        target: Option<String>,
+        /// Nix activation backend to use.
+        #[arg(long, value_enum, default_value_t = ActivationBackend::Auto)]
+        backend: ActivationBackend,
+
+        /// Nix profile path for the nix-profile backend. Defaults to Nix's user profile.
+        #[arg(long, value_name = "PATH")]
+        profile: Option<PathBuf>,
 
         /// Preview activation without changing local machine state.
         #[arg(long)]
@@ -96,10 +100,6 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
-
-        /// Activation target id, for example path-shim or systemd-user:name.service.
-        #[arg(long)]
-        target: Option<String>,
 
         /// Preview deactivation without changing local machine state.
         #[arg(long)]
@@ -122,4 +122,12 @@ pub enum Command {
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ActivationBackend {
+    Auto,
+    NixProfile,
+    NixosModule,
+    HomeManagerModule,
 }
