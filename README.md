@@ -19,8 +19,9 @@ access.
 
 ```sh
 forkpkg fork nixpkgs#xdg-desktop-portal-gnome --label remote-interaction
-curl -L https://raw.githubusercontent.com/rndhouse/forkpkg/main/examples/xdg-desktop-portal-gnome-remote-interaction.patch \
-  | forkpkg apply - xdg-desktop-portal-gnome --label remote-interaction
+forkpkg apply xdg-desktop-portal-gnome-remote-interaction.patch \
+  xdg-desktop-portal-gnome \
+  --label remote-interaction
 ```
 
 Use `build` while iterating; it checks the edited source through Nix and prints
