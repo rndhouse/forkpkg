@@ -27,31 +27,54 @@ pub enum Command {
 
     /// Rebuild a fork using its local source tree.
     Build {
-        /// Fork workspace or source directory. Defaults to the current directory.
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
     },
 
     /// Print metadata for a fork workspace.
     Info {
-        /// Fork workspace or source directory. Defaults to the current directory.
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
     },
 
     /// Make this machine use the forked build output.
     Enable {
-        /// Fork workspace or source directory. Defaults to the current directory.
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Preview activation without changing local machine state.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Revert a previous machine-local activation.
     Disable {
-        /// Fork workspace or source directory. Defaults to the current directory.
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Preview deactivation without changing local machine state.
+        #[arg(long)]
+        dry_run: bool,
     },
+
+    /// Revert every machine-local fork activation.
+    DisableAll {
+        /// Preview deactivation without changing local machine state.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Inspect forkpkg state and report stale or broken activations.
+    Doctor,
 
     /// Show whether a fork is active on this machine.
     Status {
-        /// Fork workspace or source directory. Defaults to the current directory.
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
     },
 }

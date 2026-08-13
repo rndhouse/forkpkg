@@ -23,23 +23,23 @@ impl Workspace {
     }
 }
 
-pub fn forks_dir() -> PathBuf {
-    data_home().join("forkpkg").join("forks")
+pub fn forks_dir() -> Result<PathBuf> {
+    Ok(data_home()?.join("forkpkg").join("forks"))
 }
 
-pub fn state_home() -> PathBuf {
-    match env::var_os("XDG_STATE_HOME").map(PathBuf::from) {
+pub fn state_home() -> Result<PathBuf> {
+    Ok(match env::var_os("XDG_STATE_HOME").map(PathBuf::from) {
         Some(path) if path.is_absolute() => path,
-        _ => home_dir().join(".local").join("state"),
-    }
+        _ => home_dir()?.join(".local").join("state"),
+    })
 }
 
-pub fn managed_workspace(name: &str) -> PathBuf {
-    forks_dir().join(sanitize_workspace_name(name))
+pub fn managed_workspace(name: &str) -> Result<PathBuf> {
+    Ok(forks_dir()?.join(sanitize_workspace_name(name)))
 }
 
 pub fn create_managed(name: &str) -> Result<Workspace> {
-    let root = managed_workspace(name);
+    let root = managed_workspace(name)?;
     if root.exists() {
         bail!("fork workspace already exists: {}", root.display());
     }
@@ -50,7 +50,7 @@ pub fn create_managed(name: &str) -> Result<Workspace> {
 }
 
 pub fn list_managed() -> Result<Vec<Workspace>> {
-    let forks = forks_dir();
+    let forks = forks_dir()?;
     if !forks.exists() {
         return Ok(Vec::new());
     }
@@ -100,6 +100,27 @@ pub fn find(start: Option<PathBuf>) -> Result<Workspace> {
             bail!("no forkpkg.toml found from the requested path upward");
         }
     }
+}
+
+pub fn resolve(reference: Option<PathBuf>) -> Result<Workspace> {
+    let Some(reference) = reference else {
+        return find(None);
+    };
+
+    if reference.exists() {
+        return find(Some(reference));
+    }
+
+    if reference.components().count() == 1 {
+        let name = reference.to_string_lossy();
+        let root = managed_workspace(&name)?;
+        if root.join("forkpkg.toml").is_file() {
+            return Ok(Workspace::new(root));
+        }
+        bail!("no managed fork named {name:?} found at {}", root.display());
+    }
+
+    bail!("path does not exist: {}", reference.display());
 }
 
 pub fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -176,18 +197,18 @@ fn make_writable(path: &Path, is_dir: bool) -> Result<()> {
         .with_context(|| format!("failed to make {} writable", path.display()))
 }
 
-fn data_home() -> PathBuf {
-    match env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+fn data_home() -> Result<PathBuf> {
+    Ok(match env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
         Some(path) if path.is_absolute() => path,
-        _ => home_dir().join(".local").join("share"),
-    }
+        _ => home_dir()?.join(".local").join("share"),
+    })
 }
 
-fn home_dir() -> PathBuf {
+fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| PathBuf::from("."))
+        .ok_or_else(|| anyhow!("HOME is not set to an absolute path"))
 }
 
 pub fn sanitize_workspace_name(name: &str) -> String {
@@ -221,9 +242,15 @@ pub fn sanitize_workspace_name(name: &str) -> String {
     }
 }
 
+pub fn stable_name(display_name: &str, identity: &str) -> String {
+    let display = sanitize_workspace_name(display_name);
+    let digest = blake3::hash(identity.as_bytes()).to_hex();
+    format!("{display}-{}", &digest[..12])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sanitize_workspace_name;
+    use super::{sanitize_workspace_name, stable_name};
 
     #[test]
     fn sanitizes_workspace_names() {
@@ -233,5 +260,14 @@ mod tests {
             "xdg-desktop-portal-gnome"
         );
         assert_eq!(sanitize_workspace_name("..."), "fork");
+    }
+
+    #[test]
+    fn stable_names_keep_display_text_and_distinguish_identity() {
+        let first = stable_name("ripgrep", "nixpkgs#ripgrep:x86_64-linux");
+        let second = stable_name("ripgrep", "nixpkgs#ripgrep:aarch64-linux");
+
+        assert!(first.starts_with("ripgrep-"));
+        assert_ne!(first, second);
     }
 }

@@ -181,7 +181,7 @@ let
   flake = builtins.getFlake {flake_ref};
   pkgs = flake.legacyPackages.${{builtins.currentSystem}};
   lib = pkgs.lib;
-  pkg = lib.attrByPath {attr_path} (throw "package attribute not found: {attribute}") pkgs;
+  pkg = lib.attrByPath {attr_path} (throw {attribute_message}) pkgs;
   src = pkg.src or null;
   srcIsAttrs = builtins.isAttrs src;
 in {{
@@ -201,7 +201,7 @@ in {{
 "#,
         flake_ref = nix_string(&installable.flake_ref),
         attr_path = nix_string_list(&installable.attr_path),
-        attribute = installable.attribute,
+        attribute_message = attribute_message(&installable.attribute),
     )
 }
 
@@ -212,7 +212,7 @@ let
   flake = builtins.getFlake {flake_ref};
   pkgs = flake.legacyPackages.${{builtins.currentSystem}};
   lib = pkgs.lib;
-  pkg = lib.attrByPath {attr_path} (throw "package attribute not found: {attribute}") pkgs;
+  pkg = lib.attrByPath {attr_path} (throw {attribute_message}) pkgs;
 in
   pkg.overrideAttrs (old: {{
     name = ((old.pname or old.name) + "-forkpkg-source");
@@ -226,7 +226,7 @@ in
 "#,
         flake_ref = nix_string(&installable.flake_ref),
         attr_path = nix_string_list(&installable.attr_path),
-        attribute = installable.attribute,
+        attribute_message = attribute_message(&installable.attribute),
     )
 }
 
@@ -270,7 +270,7 @@ let
   flake = builtins.getFlake {flake_ref};
   pkgs = flake.legacyPackages.${{{system}}};
   lib = pkgs.lib;
-  pkg = lib.attrByPath {attr_path} (throw "package attribute not found: {attribute}") pkgs;
+  pkg = lib.attrByPath {attr_path} (throw {attribute_message}) pkgs;
   localSource = builtins.path {{
     path = {source_path};
     name = {local_name};
@@ -289,7 +289,7 @@ in
         flake_ref = nix_string(&installable.flake_ref),
         system = nix_string(&metadata.package.system),
         attr_path = nix_string_list(&installable.attr_path),
-        attribute = installable.attribute,
+        attribute_message = attribute_message(&installable.attribute),
         source_path = nix_string(source_string),
         local_name = nix_string(&local_name),
     ))
@@ -368,6 +368,10 @@ fn nix_string(value: &str) -> String {
     out
 }
 
+fn attribute_message(attribute: &str) -> String {
+    nix_string(&format!("package attribute not found: {attribute}"))
+}
+
 fn nix_string_list(values: &[String]) -> String {
     let values = values
         .iter()
@@ -387,7 +391,7 @@ fn u64_at(value: &Value, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_installable;
+    use super::{attribute_message, nix_string, parse_installable};
 
     #[test]
     fn parses_simple_nixpkgs_installable() {
@@ -411,5 +415,18 @@ mod tests {
     #[test]
     fn rejects_output_selected_installable() {
         assert!(parse_installable("nixpkgs#ripgrep^man").is_err());
+    }
+
+    #[test]
+    fn nix_strings_escape_interpolation_and_quotes() {
+        assert_eq!(nix_string("a\"b\\${c}\n"), "\"a\\\"b\\\\\\${c}\\n\"");
+    }
+
+    #[test]
+    fn attribute_messages_are_nix_strings() {
+        assert_eq!(
+            attribute_message("bad\"pkg"),
+            "\"package attribute not found: bad\\\"pkg\""
+        );
     }
 }
