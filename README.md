@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/forkpkg-logo.png" alt="forkpkg logo" width="160">
+</p>
+
 # forkpkg
 
 `forkpkg` creates a local editable fork of a Nix package.
