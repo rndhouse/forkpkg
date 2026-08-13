@@ -28,9 +28,9 @@ forkpkg build
 For command-line tools, you can use the rebuilt version from your shell:
 
 ```sh
-forkpkg enable
+forkpkg enable hello
 hello
-forkpkg disable
+forkpkg disable hello
 ```
 
 By default, `enable` asks Nix to own activation. Command-line packages use a
