@@ -13,11 +13,17 @@ package is rebuilt and activated by the original package definition.
 
 ## Fork and Edit
 
+This repository includes an example patch for `xdg-desktop-portal-gnome` that
+changes the remote desktop permission dialog to show which app is requesting
+access. From this repository checkout:
+
 ```sh
-forkpkg fork nixpkgs#hello
+FORKPKG_CHECKOUT=$PWD
+forkpkg fork nixpkgs#xdg-desktop-portal-gnome --label remote-interaction
+cd ~/.local/share/forkpkg/forks/xdg-desktop-portal-gnome/remote-interaction/source
+git am "$FORKPKG_CHECKOUT/examples/xdg-desktop-portal-gnome-remote-interaction.patch"
 ```
 
-Then change into the `source:` directory printed by `forkpkg` and edit files.
 Use `build` while iterating; it checks the edited source through Nix and prints
 the rebuilt output path without changing what your shell or system uses.
 
@@ -27,20 +33,22 @@ forkpkg build
 
 ## Enable/Disable Forks
 
-Enable the fork, run the command as usual, then disable it when you want to go
-back to the previous package:
+Inspect the available activation targets, enable the fork, then disable it when
+you want to go back to the previous package:
 
 ```sh
-forkpkg enable hello
-hello
-forkpkg disable hello
+forkpkg targets xdg-desktop-portal-gnome --label remote-interaction
+forkpkg enable xdg-desktop-portal-gnome \
+  --label remote-interaction \
+  --backend nixos-module
+forkpkg disable xdg-desktop-portal-gnome --label remote-interaction
 ```
 
 By default, `enable` asks Nix to own activation. Command-line packages use a
 Nix profile. NixOS and Home Manager packages can use generated modules and the
-normal switch flow.
-
-Run `forkpkg targets` to see the activation choices for a built fork.
+normal switch flow. For generated modules, keep the printed module path
+imported in your config and switch your system after enabling or disabling the
+fork.
 
 ## Multiple Forks
 
