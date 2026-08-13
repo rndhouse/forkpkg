@@ -5,11 +5,12 @@
   </picture>
 </p>
 
-`forkpkg` creates a local editable fork of a Nix package.
+`forkpkg` turns a Nix package into an editable local Git fork of the exact
+post-patch source tree Nix builds.
 
-Give it a package such as `nixpkgs#hello`. It copies the source tree that Nix
-would build into a local Git repo. When you run `forkpkg build`, Nix rebuilds
-the original package using your edited source.
+Edit the source like a normal checkout, then rebuild it through the original
+Nix package definition so dependencies, build flags, outputs, and activation
+stay Nix-owned.
 
 ## Edit and Build
 
