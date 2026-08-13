@@ -7,9 +7,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub format: u32,
+    #[serde(default = "default_fork_metadata")]
+    pub fork: ForkMetadata,
     pub package: PackageMetadata,
     pub base: BaseMetadata,
     pub build: BuildMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkMetadata {
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +73,14 @@ pub struct BuildMetadata {
 }
 
 impl Metadata {
+    pub fn fork_label(&self) -> &str {
+        if self.fork.label.is_empty() {
+            "default"
+        } else {
+            &self.fork.label
+        }
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read metadata {}", path.display()))?;
@@ -75,5 +90,11 @@ impl Metadata {
     pub fn write(&self, path: &Path) -> Result<()> {
         let text = toml::to_string_pretty(self).context("failed to serialize metadata")?;
         fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
+fn default_fork_metadata() -> ForkMetadata {
+    ForkMetadata {
+        label: "default".to_owned(),
     }
 }

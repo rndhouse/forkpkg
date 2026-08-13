@@ -3,6 +3,8 @@ mod cli;
 mod git;
 mod metadata;
 mod nix;
+mod sharing;
+mod targets;
 mod workspace;
 
 use std::path::PathBuf;
@@ -13,7 +15,7 @@ use serde::Serialize;
 
 use crate::activation::{ActivationRecordEntry, PreviousLink};
 use crate::cli::{Cli, Command};
-use crate::metadata::{BaseMetadata, BuildMetadata, Metadata, PackageMetadata};
+use crate::metadata::{BaseMetadata, BuildMetadata, ForkMetadata, Metadata, PackageMetadata};
 
 fn main() {
     if let Err(error) = run() {
@@ -26,23 +28,61 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Fork { installable } => fork(&installable),
+        Command::Fork { installable, label } => fork(&installable, label.as_deref()),
         Command::List { json } => list(json),
         Command::Build { path } => build(path),
+        Command::Export { path, output } => export(path, output),
+        Command::Import { artifact, path } => import(artifact, path),
         Command::Info { path } => info(path),
-        Command::Enable { path, dry_run } => enable(path, dry_run),
-        Command::Disable { path, dry_run } => disable(path, dry_run),
+        Command::Targets { path, json } => targets(path, json),
+        Command::Enable {
+            path,
+            target,
+            dry_run,
+        } => enable(path, target.as_deref(), dry_run),
+        Command::Disable {
+            path,
+            target,
+            dry_run,
+        } => disable(path, target.as_deref(), dry_run),
         Command::DisableAll { dry_run } => disable_all(dry_run),
         Command::Doctor => doctor(),
         Command::Status { path } => status(path),
     }
 }
 
-fn fork(installable: &str) -> Result<()> {
+fn fork(installable: &str, requested_label: Option<&str>) -> Result<()> {
     eprintln!("resolving {installable}");
     let resolved = nix::resolve_installable(installable)?;
     let workspace_name = workspace_name(&resolved);
-    let workspace_path = workspace::managed_workspace(&workspace_name)?;
+    let existing = workspace::list_package(&workspace_name)?;
+    let label = fork_label_or_default(requested_label, &workspace_name, existing.len())?;
+
+    if requested_label.is_some()
+        && label != workspace::DEFAULT_LABEL
+        && workspace::legacy_workspace_exists(&workspace_name)?
+    {
+        let legacy_workspace =
+            workspace::Workspace::new(workspace::legacy_workspace(&workspace_name)?);
+        let legacy_metadata = Metadata::read(&legacy_workspace.metadata)?;
+        if activation::status(&legacy_metadata)?.is_some() {
+            anyhow::bail!(
+                "legacy fork {workspace_name}/{} is active; disable it before creating another label",
+                workspace::DEFAULT_LABEL
+            );
+        }
+        eprintln!(
+            "migrating legacy workspace for {workspace_name} to {workspace_name}/{}",
+            workspace::DEFAULT_LABEL
+        );
+        workspace::migrate_legacy_to_default(&workspace_name)?;
+    }
+
+    if label == workspace::DEFAULT_LABEL && workspace::legacy_workspace_exists(&workspace_name)? {
+        anyhow::bail!("fork workspace already exists: {workspace_name}/{label}");
+    }
+
+    let workspace_path = workspace::managed_workspace(&workspace_name, &label)?;
     if workspace_path.exists() {
         anyhow::bail!(
             "fork workspace already exists: {}",
@@ -59,7 +99,7 @@ fn fork(installable: &str) -> Result<()> {
     )?;
 
     eprintln!("creating workspace at {}", workspace_path.display());
-    let workspace = workspace::create_managed(&workspace_name)?;
+    let workspace = workspace::create_managed(&workspace_name, &label)?;
     workspace::copy_tree(&post_patch_source, &workspace.source)?;
 
     let base_description = base_description(&resolved);
@@ -71,6 +111,9 @@ fn fork(installable: &str) -> Result<()> {
 
     let metadata = Metadata {
         format: 1,
+        fork: ForkMetadata {
+            label: label.clone(),
+        },
         package: PackageMetadata {
             installable: resolved.installable.original.clone(),
             flake_ref: resolved.installable.flake_ref.clone(),
@@ -112,6 +155,7 @@ fn fork(installable: &str) -> Result<()> {
         .with_context(|| format!("workspace remains at {}", workspace.root.display()))?;
 
     println!("workspace: {}", workspace.root.display());
+    println!("fork: {workspace_name}/{label}");
     println!("source: {}", workspace.source.display());
     println!("base_commit: {base_commit}");
     println!("output: {}", output.display());
@@ -128,6 +172,8 @@ struct ListOutput {
 #[derive(Debug, Serialize)]
 struct ForkListEntry {
     package: String,
+    label: String,
+    reference: String,
     name: Option<String>,
     version: Option<String>,
     installable: String,
@@ -183,7 +229,7 @@ fn list(json: bool) -> Result<()> {
     for fork in output.forks {
         println!(
             "{} {} active:{} commits_on_top:{} dirty:{}",
-            fork.package,
+            fork.reference,
             fork.version.as_deref().unwrap_or("-"),
             yes_no(fork.active),
             fork.git
@@ -238,9 +284,13 @@ fn collect_list() -> Result<ListOutput> {
             .clone()
             .or_else(|| metadata.package.name.clone())
             .unwrap_or_else(|| metadata.package.attribute.clone());
+        let label = metadata.fork_label().to_owned();
+        let reference = fork_reference(&package, &label);
 
         forks.push(ForkListEntry {
             package,
+            label,
+            reference,
             name: metadata.package.name,
             version: metadata.package.version,
             installable: metadata.package.installable,
@@ -286,13 +336,49 @@ fn build(path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+fn export(path: Option<PathBuf>, output: PathBuf) -> Result<()> {
+    let workspace = workspace::resolve(path)?;
+    let metadata = Metadata::read(&workspace.metadata)?;
+    let summary = sharing::export_changes(&workspace, &metadata, &output)?;
+
+    println!("exported: {}", summary.artifact.display());
+    println!("base_commit: {}", summary.base_commit);
+    println!("head: {}", summary.head_commit);
+    println!("commits: {}", summary.commit_count);
+
+    Ok(())
+}
+
+fn import(artifact: PathBuf, path: Option<PathBuf>) -> Result<()> {
+    let workspace = workspace::resolve(path)?;
+    let metadata = Metadata::read(&workspace.metadata)?;
+    let summary = sharing::import_changes(&workspace, &metadata, &artifact)?;
+
+    println!("imported: {}", summary.artifact.display());
+    println!("method: {}", summary.method);
+    println!("base_commit: {}", summary.base_commit);
+    println!("head: {}", summary.head_commit);
+    println!("commits: {}", summary.commit_count);
+
+    Ok(())
+}
+
 fn info(path: Option<PathBuf>) -> Result<()> {
     let workspace = workspace::resolve(path)?;
     let metadata = Metadata::read(&workspace.metadata)?;
+    let package = metadata
+        .package
+        .pname
+        .as_deref()
+        .or(metadata.package.name.as_deref())
+        .unwrap_or(&metadata.package.attribute);
+    let label = metadata.fork_label();
 
     print_optional("package", metadata.package.pname.as_deref());
     print_optional("name", metadata.package.name.as_deref());
     print_optional("version", metadata.package.version.as_deref());
+    println!("label: {label}");
+    println!("reference: {}", fork_reference(package, label));
     println!("installable: {}", metadata.package.installable);
     println!("attribute: {}", metadata.package.attribute);
     println!("system: {}", metadata.package.system);
@@ -317,7 +403,99 @@ fn info(path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn enable(path: Option<PathBuf>, dry_run: bool) -> Result<()> {
+fn targets(path: Option<PathBuf>, json: bool) -> Result<()> {
+    let workspace = workspace::resolve(path)?;
+    let metadata = Metadata::read(&workspace.metadata)?;
+    let output = nix::build_local_source(&metadata, &workspace.source)?;
+    let mut report = targets::discover(&output)?;
+    mark_active_targets(&metadata, &mut report)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("failed to serialize targets JSON")?
+        );
+        return Ok(());
+    }
+
+    println!("output: {}", report.output.display());
+    if report.targets.is_empty() {
+        println!("no activation targets found");
+        return Ok(());
+    }
+
+    for target in &report.targets {
+        println!(
+            "{} kind:{} confidence:{} supported:{} active:{}",
+            target.id,
+            target.kind,
+            target.confidence,
+            yes_no(target.supported),
+            yes_no(target.active),
+        );
+        match &target.details {
+            targets::TargetDetails::PathShim {
+                executables,
+                path_matches,
+            } => {
+                for executable in executables {
+                    println!("  executable: {}", executable.display());
+                }
+                for path_match in path_matches {
+                    println!(
+                        "  path_match: {} resolved:{} points_to_output:{}",
+                        path_match.path.display(),
+                        path_match
+                            .resolved
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                        yes_no(path_match.points_to_output),
+                    );
+                }
+            }
+            targets::TargetDetails::SystemdUserService {
+                service,
+                service_file,
+                exec_start,
+                executable,
+                dbus_names,
+            } => {
+                println!("  service: {service}");
+                println!("  service_file: {}", service_file.display());
+                println!("  exec_start: {exec_start}");
+                if let Some(executable) = executable {
+                    println!("  executable: {}", executable.display());
+                }
+                for dbus_name in dbus_names {
+                    println!("  dbus_name: {dbus_name}");
+                }
+            }
+            targets::TargetDetails::DbusService {
+                name,
+                service_file,
+                exec,
+                systemd_service,
+            } => {
+                println!("  name: {name}");
+                println!("  service_file: {}", service_file.display());
+                if let Some(exec) = exec {
+                    println!("  exec: {exec}");
+                }
+                if let Some(systemd_service) = systemd_service {
+                    println!("  systemd_service: {systemd_service}");
+                }
+            }
+        }
+        for evidence in &target.evidence {
+            println!("  evidence: {evidence}");
+        }
+    }
+
+    Ok(())
+}
+
+fn enable(path: Option<PathBuf>, requested_target: Option<&str>, dry_run: bool) -> Result<()> {
     let workspace = workspace::resolve(path)?;
     let metadata = Metadata::read(&workspace.metadata)?;
 
@@ -327,10 +505,29 @@ fn enable(path: Option<PathBuf>, dry_run: bool) -> Result<()> {
         eprintln!("building fork before activation");
     }
     let output = nix::build_local_source(&metadata, &workspace.source)?;
+    let mut report = targets::discover(&output)?;
+    mark_active_targets(&metadata, &mut report)?;
+    let target = select_target(&report, requested_target)?;
+
+    match target.kind.as_str() {
+        "path-shim" => enable_path_shim_target(&metadata, &workspace, &output, dry_run),
+        "systemd-user-service" => {
+            enable_systemd_user_target(&metadata, &workspace, &output, target, dry_run)
+        }
+        other => anyhow::bail!("activation target kind is not supported yet: {other}"),
+    }
+}
+
+fn enable_path_shim_target(
+    metadata: &Metadata,
+    workspace: &workspace::Workspace,
+    output: &std::path::Path,
+    dry_run: bool,
+) -> Result<()> {
     let record = if dry_run {
-        activation::plan_path_shim(&metadata, &workspace, &output)?
+        activation::plan_path_shim(metadata, workspace, output)?
     } else {
-        activation::enable_path_shim(&metadata, &workspace, &output)?
+        activation::enable_path_shim(metadata, workspace, output)?
     };
 
     if dry_run {
@@ -381,14 +578,68 @@ fn enable(path: Option<PathBuf>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn disable(path: Option<PathBuf>, dry_run: bool) -> Result<()> {
+fn enable_systemd_user_target(
+    metadata: &Metadata,
+    workspace: &workspace::Workspace,
+    output: &std::path::Path,
+    target: &targets::ActivationTarget,
+    dry_run: bool,
+) -> Result<()> {
+    let spec = targets::systemd_user_service_spec(target)?;
+    let executable = spec
+        .executable
+        .as_ref()
+        .context("systemd user service target has no absolute executable")?;
+
+    if !executable.starts_with(output) {
+        anyhow::bail!(
+            "refusing service activation because target executable is outside the forked output: {}",
+            executable.display()
+        );
+    }
+
+    let record = if dry_run {
+        activation::plan_systemd_user_service(
+            metadata,
+            workspace,
+            output,
+            &spec.service,
+            &spec.service_file,
+            &spec.exec_start,
+            executable,
+        )?
+    } else {
+        activation::enable_systemd_user_service(
+            metadata,
+            workspace,
+            output,
+            &spec.service,
+            &spec.service_file,
+            &spec.exec_start,
+            executable,
+        )?
+    };
+
+    if dry_run {
+        println!("would enable: {}", target.id);
+    } else {
+        println!("enabled: {}", target.id);
+    }
+    println!("mode: {}", record.mode);
+    println!("output: {}", record.build_output.display());
+    print_service_records(&record, dry_run);
+
+    Ok(())
+}
+
+fn disable(path: Option<PathBuf>, requested_target: Option<&str>, dry_run: bool) -> Result<()> {
     let workspace = workspace::resolve(path)?;
     let metadata = Metadata::read(&workspace.metadata)?;
-    let record = if dry_run {
-        activation::disable_plan(&metadata)?
-    } else {
-        activation::disable(&metadata)?
-    };
+    let record = activation::disable_plan(&metadata)?;
+    ensure_record_matches_requested_target(&record, requested_target)?;
+    if !dry_run {
+        activation::disable_record(&record)?;
+    }
 
     if dry_run {
         println!("would disable: {}", record.package);
@@ -419,6 +670,7 @@ fn disable(path: Option<PathBuf>, dry_run: bool) -> Result<()> {
             }
         }
     }
+    print_service_records(&record, dry_run);
 
     Ok(())
 }
@@ -476,7 +728,7 @@ fn doctor() -> Result<()> {
     for workspace in &forks {
         match Metadata::read(&workspace.metadata) {
             Ok(metadata) => {
-                let package = activation::package_display_name(&metadata);
+                let package = activation::fork_display_name(&metadata);
                 match activation::status(&metadata) {
                     Ok(active) => {
                         println!(
@@ -518,7 +770,7 @@ fn doctor() -> Result<()> {
     for entry in records {
         match entry {
             ActivationRecordEntry::Valid { record, .. } => {
-                let check = activation::check_record(record);
+                let check = activation::check_record(*record);
                 if check.is_ok() {
                     println!("activation: {} status:ok", check.record.package);
                     for link in &check.record.links {
@@ -528,6 +780,19 @@ fn doctor() -> Result<()> {
                             link.target.display()
                         );
                         print_indented_target_blake3(link, true);
+                    }
+                    for service in &check.record.services {
+                        println!(
+                            "  service: {} override:{}",
+                            service.service,
+                            service.override_path.display()
+                        );
+                        match &service.target_blake3 {
+                            Some(hash) => {
+                                println!("  target_blake3: {hash} verified:yes");
+                            }
+                            None => println!("  target_blake3: missing verified:no"),
+                        }
                     }
                 } else {
                     problems += check.problems.len();
@@ -565,11 +830,13 @@ fn status(path: Option<PathBuf>) -> Result<()> {
         .as_deref()
         .or(metadata.package.name.as_deref())
         .unwrap_or(&metadata.package.attribute);
+    let label = metadata.fork_label();
+    let reference = fork_reference(package, label);
 
     match activation::status(&metadata)? {
         Some(record) => {
             let check = activation::check_record(record.clone());
-            println!("fork: {package}");
+            println!("fork: {reference}");
             if check.is_ok() {
                 println!("active: yes");
                 println!("verified: yes");
@@ -582,6 +849,9 @@ fn status(path: Option<PathBuf>) -> Result<()> {
             }
             println!("mode: {}", record.mode);
             println!("output: {}", record.build_output.display());
+            for target_id in record_target_ids(&record) {
+                println!("target: {target_id}");
+            }
             for link in &record.links {
                 println!(
                     "binary: {} -> {}",
@@ -596,9 +866,20 @@ fn status(path: Option<PathBuf>) -> Result<()> {
                     }
                 }
             }
+            for service in &record.services {
+                println!("service: {}", service.service);
+                println!("service_file: {}", service.service_file.display());
+                println!("override: {}", service.override_path.display());
+                println!("exec_start: {}", service.exec_start);
+                println!("target: {}", service.target.display());
+                match &service.target_blake3 {
+                    Some(hash) => println!("target_blake3: {hash}"),
+                    None => println!("target_blake3: missing"),
+                }
+            }
         }
         None => {
-            println!("fork: {package}");
+            println!("fork: {reference}");
             println!("active: no");
         }
     }
@@ -643,6 +924,120 @@ fn print_disable_record_links(record: &activation::ActivationRecord, dry_run: bo
             }
         }
     }
+    print_service_records(record, dry_run);
+}
+
+fn print_service_records(record: &activation::ActivationRecord, dry_run: bool) {
+    for service in &record.services {
+        if dry_run {
+            println!("override: {}", service.override_path.display());
+            println!("would run: systemctl --user daemon-reload");
+            println!("would run: systemctl --user restart {}", service.service);
+        } else {
+            println!("service: {}", service.service);
+            println!("override: {}", service.override_path.display());
+        }
+        println!("service_file: {}", service.service_file.display());
+        println!("exec_start: {}", service.exec_start);
+        println!("target: {}", service.target.display());
+        match &service.target_blake3 {
+            Some(hash) => println!("target_blake3: {hash}"),
+            None => println!("target_blake3: missing"),
+        }
+    }
+}
+
+fn mark_active_targets(metadata: &Metadata, report: &mut targets::TargetReport) -> Result<()> {
+    let Some(record) = activation::status(metadata)? else {
+        return Ok(());
+    };
+    let active_target_ids = record_target_ids(&record);
+    for target in &mut report.targets {
+        target.active = active_target_ids.iter().any(|id| id == &target.id);
+    }
+    Ok(())
+}
+
+fn ensure_record_matches_requested_target(
+    record: &activation::ActivationRecord,
+    requested_target: Option<&str>,
+) -> Result<()> {
+    let Some(requested_target) = requested_target else {
+        return Ok(());
+    };
+    let target_ids = record_target_ids(record);
+    if target_ids.iter().any(|id| id == requested_target) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "active record target mismatch; active target(s): {}",
+        target_ids.join(", ")
+    )
+}
+
+fn record_target_ids(record: &activation::ActivationRecord) -> Vec<String> {
+    let mut ids = Vec::new();
+    if !record.links.is_empty() {
+        ids.push("path-shim".to_owned());
+    }
+    for service in &record.services {
+        ids.push(format!("systemd-user:{}", service.service));
+    }
+    ids
+}
+
+fn select_target<'a>(
+    report: &'a targets::TargetReport,
+    requested_target: Option<&str>,
+) -> Result<&'a targets::ActivationTarget> {
+    if let Some(requested_target) = requested_target {
+        return report
+            .targets
+            .iter()
+            .find(|target| target.id == requested_target)
+            .with_context(|| format!("activation target not found: {requested_target}"));
+    }
+
+    let supported = report
+        .targets
+        .iter()
+        .filter(|target| target.supported)
+        .collect::<Vec<_>>();
+
+    match supported.as_slice() {
+        [target] => Ok(*target),
+        [] => anyhow::bail!("no supported activation target found; run forkpkg targets first"),
+        _ => {
+            let ids = supported
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("multiple activation targets found ({ids}); rerun with --target <id>")
+        }
+    }
+}
+
+fn fork_label_or_default(
+    requested_label: Option<&str>,
+    package: &str,
+    existing_count: usize,
+) -> Result<String> {
+    match requested_label {
+        Some(label) => Ok(workspace::sanitize_workspace_name(label)),
+        None if existing_count == 0 => Ok(workspace::DEFAULT_LABEL.to_owned()),
+        None => anyhow::bail!(
+            "fork already exists for {package}; use --label <label> to create another fork"
+        ),
+    }
+}
+
+fn fork_reference(package: &str, label: &str) -> String {
+    format!(
+        "{}/{}",
+        workspace::sanitize_workspace_name(package),
+        workspace::sanitize_workspace_name(label)
+    )
 }
 
 fn workspace_name(resolved: &nix::ResolvedPackage) -> String {
@@ -653,7 +1048,7 @@ fn workspace_name(resolved: &nix::ResolvedPackage) -> String {
         .or(resolved.package_name.as_deref())
         .unwrap_or("package")
         .to_owned();
-    workspace::stable_name(&display_name, &resolved_identity(resolved))
+    workspace::sanitize_workspace_name(&display_name)
 }
 
 fn base_description(resolved: &nix::ResolvedPackage) -> String {
@@ -665,28 +1060,6 @@ fn base_description(resolved: &nix::ResolvedPackage) -> String {
     } else {
         resolved.installable.original.clone()
     }
-}
-
-fn resolved_identity(resolved: &nix::ResolvedPackage) -> String {
-    format!(
-        "\
-installable={}\n\
-flake_ref={}\n\
-attribute={}\n\
-system={}\n\
-nixpkgs_revision={}\n\
-nixpkgs_locked_nar_hash={}\n\
-nixpkgs_resolved_url={}\n\
-nixpkgs_path={}\n",
-        resolved.installable.original,
-        resolved.installable.flake_ref,
-        resolved.installable.attribute,
-        resolved.system,
-        resolved.flake.revision.as_deref().unwrap_or(""),
-        resolved.flake.locked_nar_hash.as_deref().unwrap_or(""),
-        resolved.flake.resolved_url.as_deref().unwrap_or(""),
-        resolved.flake.path.as_deref().unwrap_or(""),
-    )
 }
 
 fn print_optional(label: &str, value: Option<&str>) {

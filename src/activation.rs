@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,7 +24,10 @@ pub struct ActivationRecord {
     pub source: PathBuf,
     pub build_output: PathBuf,
     pub activated_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<LinkRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ServiceRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +38,17 @@ pub struct LinkRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_blake3: Option<String>,
     pub previous: PreviousLink,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceRecord {
+    pub service: String,
+    pub service_file: PathBuf,
+    pub override_path: PathBuf,
+    pub exec_start: String,
+    pub target: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_blake3: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +74,7 @@ impl ActivationCheck {
 pub enum ActivationRecordEntry {
     Valid {
         path: PathBuf,
-        record: ActivationRecord,
+        record: Box<ActivationRecord>,
     },
     Broken {
         path: PathBuf,
@@ -80,6 +95,7 @@ impl ActivationRecordEntry {
 struct ActivationPaths {
     activations_dir: PathBuf,
     user_bin_dir: PathBuf,
+    user_config_dir: PathBuf,
 }
 
 impl ActivationPaths {
@@ -87,6 +103,7 @@ impl ActivationPaths {
         Ok(Self {
             activations_dir: activations_dir()?,
             user_bin_dir: user_bin_dir()?,
+            user_config_dir: user_config_dir()?,
         })
     }
 
@@ -119,14 +136,127 @@ pub fn plan_path_shim(
     plan_path_shim_with_paths(metadata, workspace, build_output, &paths)
 }
 
+pub fn enable_systemd_user_service(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+    service: &str,
+    service_file: &Path,
+    exec_start: &str,
+    target: &Path,
+) -> Result<ActivationRecord> {
+    let paths = ActivationPaths::from_env()?;
+    let record = plan_systemd_user_service_with_paths(
+        metadata,
+        workspace,
+        build_output,
+        service,
+        service_file,
+        exec_start,
+        target,
+        &paths,
+    )?;
+    apply_enable_record(&record, &paths)?;
+    Ok(record)
+}
+
+pub fn plan_systemd_user_service(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+    service: &str,
+    service_file: &Path,
+    exec_start: &str,
+    target: &Path,
+) -> Result<ActivationRecord> {
+    let paths = ActivationPaths::from_env()?;
+    plan_systemd_user_service_with_paths(
+        metadata,
+        workspace,
+        build_output,
+        service,
+        service_file,
+        exec_start,
+        target,
+        &paths,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_systemd_user_service_with_paths(
+    metadata: &Metadata,
+    workspace: &Workspace,
+    build_output: &Path,
+    service: &str,
+    service_file: &Path,
+    exec_start: &str,
+    target: &Path,
+    paths: &ActivationPaths,
+) -> Result<ActivationRecord> {
+    let key = fork_key(metadata);
+    let package = fork_display_name(metadata);
+    for record_path in record_paths_for_metadata(metadata, paths) {
+        if record_path.exists() {
+            bail!("{package} is already active; run forkpkg disable first");
+        }
+    }
+
+    if !target.is_absolute() {
+        bail!(
+            "systemd user service target is not absolute: {}",
+            target.display()
+        );
+    }
+    if !target.exists() {
+        bail!(
+            "systemd user service target does not exist: {}",
+            target.display()
+        );
+    }
+
+    let override_path = paths
+        .user_config_dir
+        .join("systemd")
+        .join("user")
+        .join(format!("{service}.d"))
+        .join("forkpkg.conf");
+    if link_exists(&override_path)? {
+        bail!(
+            "refusing to overwrite existing systemd override: {}",
+            override_path.display()
+        );
+    }
+
+    Ok(ActivationRecord {
+        format: 1,
+        key,
+        mode: "systemd-user-service".to_owned(),
+        package,
+        installable: metadata.package.installable.clone(),
+        workspace: workspace.root.clone(),
+        source: workspace.source.clone(),
+        build_output: build_output.to_path_buf(),
+        activated_at_unix: unix_time_secs()?,
+        links: Vec::new(),
+        services: vec![ServiceRecord {
+            service: service.to_owned(),
+            service_file: service_file.to_path_buf(),
+            override_path,
+            exec_start: exec_start.to_owned(),
+            target: target.to_path_buf(),
+            target_blake3: Some(blake3_file(target)?),
+        }],
+    })
+}
+
 fn plan_path_shim_with_paths(
     metadata: &Metadata,
     workspace: &Workspace,
     build_output: &Path,
     paths: &ActivationPaths,
 ) -> Result<ActivationRecord> {
-    let key = package_key(metadata);
-    let package = package_display_name(metadata);
+    let key = fork_key(metadata);
+    let package = fork_display_name(metadata);
     let activation_dir = paths.activation_dir(&key);
     for record_path in record_paths_for_metadata(metadata, paths) {
         if record_path.exists() {
@@ -148,6 +278,7 @@ fn plan_path_shim_with_paths(
     }
 
     let mut links = Vec::new();
+    let active_records = list_record_entries_with_paths(paths)?;
     for target in entries {
         let name = target
             .file_name()
@@ -156,6 +287,23 @@ fn plan_path_shim_with_paths(
             .into_owned();
         let link = paths.user_bin_dir.join(&name);
         let backup = activation_dir.join("backups").join(&name);
+
+        for entry in &active_records {
+            let ActivationRecordEntry::Valid { record, .. } = entry else {
+                continue;
+            };
+            if record.key == key {
+                continue;
+            }
+            if record.links.iter().any(|existing| existing.link == link) {
+                bail!(
+                    "{} is already managed by active fork {}; run forkpkg disable {} first",
+                    link.display(),
+                    record.package,
+                    record.package
+                );
+            }
+        }
 
         let previous = if link_exists(&link)? {
             if is_plain_directory(&link)? {
@@ -195,14 +343,8 @@ fn plan_path_shim_with_paths(
         build_output: build_output.to_path_buf(),
         activated_at_unix: unix_time_secs()?,
         links,
+        services: Vec::new(),
     })
-}
-
-pub fn disable(metadata: &Metadata) -> Result<ActivationRecord> {
-    let paths = ActivationPaths::from_env()?;
-    let record = disable_plan_with_paths(metadata, &paths)?;
-    apply_disable_record(&record, &paths)?;
-    Ok(record)
 }
 
 pub fn disable_record(record: &ActivationRecord) -> Result<()> {
@@ -220,7 +362,7 @@ fn disable_plan_with_paths(
     paths: &ActivationPaths,
 ) -> Result<ActivationRecord> {
     let record = read_record_for_metadata(metadata, paths)?
-        .ok_or_else(|| anyhow!("{} is not active", package_display_name(metadata)))?;
+        .ok_or_else(|| anyhow!("{} is not active", fork_display_name(metadata)))?;
     preflight_disable_record(&record, paths)?;
     Ok(record)
 }
@@ -236,34 +378,41 @@ fn list_record_entries_with_paths(paths: &ActivationPaths) -> Result<Vec<Activat
     }
 
     let mut entries = Vec::new();
-    for entry in fs::read_dir(&paths.activations_dir)
-        .with_context(|| format!("failed to read {}", paths.activations_dir.display()))?
-    {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to read entry in {}",
-                paths.activations_dir.display()
-            )
-        })?;
-        let record_path = entry.path().join("activation.toml");
-        if !record_path.exists() {
+    collect_record_entries(&paths.activations_dir, &mut entries)?;
+    entries.sort_by(|left, right| left.path().cmp(right.path()));
+    Ok(entries)
+}
+
+fn collect_record_entries(dir: &Path, entries: &mut Vec<ActivationRecordEntry>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if !file_type.is_dir() {
             continue;
         }
 
-        match read_record(&record_path) {
-            Ok(record) => entries.push(ActivationRecordEntry::Valid {
-                path: record_path,
-                record,
-            }),
-            Err(error) => entries.push(ActivationRecordEntry::Broken {
-                path: record_path,
-                problem: format!("{error:#}"),
-            }),
+        let record_path = path.join("activation.toml");
+        if record_path.exists() {
+            match read_record(&record_path) {
+                Ok(record) => entries.push(ActivationRecordEntry::Valid {
+                    path: record_path,
+                    record: Box::new(record),
+                }),
+                Err(error) => entries.push(ActivationRecordEntry::Broken {
+                    path: record_path,
+                    problem: format!("{error:#}"),
+                }),
+            }
+            continue;
         }
+
+        collect_record_entries(&path, entries)?;
     }
 
-    entries.sort_by(|left, right| left.path().cmp(right.path()));
-    Ok(entries)
+    Ok(())
 }
 
 pub fn check_record(record: ActivationRecord) -> ActivationCheck {
@@ -336,6 +485,50 @@ pub fn check_record(record: ActivationRecord) -> ActivationCheck {
             && !backup.exists()
         {
             problems.push(format!("backup is missing: {}", backup.display()));
+        }
+    }
+
+    for service in &record.services {
+        if !service.service_file.exists() {
+            problems.push(format!(
+                "service file is missing: {}",
+                service.service_file.display()
+            ));
+        }
+        if !service.override_path.is_file() {
+            problems.push(format!(
+                "systemd override is missing: {}",
+                service.override_path.display()
+            ));
+        } else {
+            match fs::read_to_string(&service.override_path) {
+                Ok(text) if text.contains(&service.exec_start) => {}
+                Ok(_) => problems.push(format!(
+                    "systemd override no longer points to {}",
+                    service.exec_start
+                )),
+                Err(error) => problems.push(format!(
+                    "failed to read systemd override {}: {error}",
+                    service.override_path.display()
+                )),
+            }
+        }
+        if !service.target.exists() {
+            problems.push(format!("target is missing: {}", service.target.display()));
+        } else if let Some(expected) = &service.target_blake3 {
+            match blake3_file(&service.target) {
+                Ok(actual) if actual == *expected => {}
+                Ok(actual) => problems.push(format!(
+                    "target hash mismatch for {}: expected {}, got {}",
+                    service.target.display(),
+                    expected,
+                    actual
+                )),
+                Err(error) => problems.push(format!(
+                    "failed to hash target {}: {error}",
+                    service.target.display()
+                )),
+            }
         }
     }
 
@@ -414,6 +607,16 @@ fn try_apply_enable_record(
         }
     }
 
+    for service in &record.services {
+        write_service_override_atomic(service)?;
+        undo.push(EnableUndo::RemoveCreatedServiceOverride {
+            service: service.service.clone(),
+            override_path: service.override_path.clone(),
+        });
+        systemctl_user(["daemon-reload"])?;
+        systemctl_user(["restart", service.service.as_str()])?;
+    }
+
     write_record_atomic(record, paths)
 }
 
@@ -451,6 +654,16 @@ fn preflight_enable_record(record: &ActivationRecord, paths: &ActivationPaths) -
                     );
                 }
             }
+        }
+    }
+
+    for service in &record.services {
+        ensure_target_path_is_unchanged(&service.target, service.target_blake3.as_ref())?;
+        if link_exists(&service.override_path)? {
+            bail!(
+                "refusing to overwrite existing systemd override: {}",
+                service.override_path.display()
+            );
         }
     }
 
@@ -502,12 +715,39 @@ fn try_apply_disable_record(
         }
     }
 
+    for service in &record.services {
+        let previous_text = fs::read_to_string(&service.override_path).with_context(|| {
+            format!(
+                "failed to read systemd override {}",
+                service.override_path.display()
+            )
+        })?;
+        fs::remove_file(&service.override_path).with_context(|| {
+            format!(
+                "failed to remove systemd override {}",
+                service.override_path.display()
+            )
+        })?;
+        undo.push(DisableUndo::RestoreServiceOverride {
+            service: service.service.clone(),
+            override_path: service.override_path.clone(),
+            text: previous_text,
+        });
+        systemctl_user(["daemon-reload"])?;
+        systemctl_user(["restart", service.service.as_str()])?;
+    }
+
     let record_path = paths.record_path(record);
     fs::remove_file(&record_path)
         .with_context(|| format!("failed to remove {}", record_path.display()))?;
     let dir = paths.activation_dir(&record.key);
     let _ = remove_dir_if_empty(&dir.join("backups"));
     let _ = remove_dir_if_empty(&dir);
+    for service in &record.services {
+        if let Some(parent) = service.override_path.parent() {
+            let _ = remove_dir_if_empty(parent);
+        }
+    }
     Ok(())
 }
 
@@ -526,6 +766,28 @@ fn preflight_disable_record(record: &ActivationRecord, paths: &ActivationPaths) 
         }
     }
 
+    for service in &record.services {
+        ensure_target_path_is_unchanged(&service.target, service.target_blake3.as_ref())?;
+        if !service.override_path.is_file() {
+            bail!(
+                "systemd override is missing: {}",
+                service.override_path.display()
+            );
+        }
+        let text = fs::read_to_string(&service.override_path).with_context(|| {
+            format!(
+                "failed to read systemd override {}",
+                service.override_path.display()
+            )
+        })?;
+        if !text.contains(&service.exec_start) {
+            bail!(
+                "refusing to disable because systemd override no longer points to {}",
+                service.exec_start
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -536,6 +798,22 @@ pub fn status(metadata: &Metadata) -> Result<Option<ActivationRecord>> {
 
 pub fn package_key(metadata: &Metadata) -> String {
     workspace::stable_name(&package_display_name(metadata), &package_identity(metadata))
+}
+
+pub fn fork_key(metadata: &Metadata) -> String {
+    format!(
+        "{}/{}",
+        package_key(metadata),
+        workspace::sanitize_workspace_name(metadata.fork_label())
+    )
+}
+
+pub fn fork_display_name(metadata: &Metadata) -> String {
+    format!(
+        "{}/{}",
+        workspace::sanitize_workspace_name(&package_display_name(metadata)),
+        workspace::sanitize_workspace_name(metadata.fork_label())
+    )
 }
 
 pub fn package_display_name(metadata: &Metadata) -> String {
@@ -664,16 +942,92 @@ fn ensure_link_points_to_target(link: &LinkRecord) -> Result<()> {
 }
 
 fn ensure_target_is_unchanged(link: &LinkRecord) -> Result<()> {
-    if let Some(expected) = &link.target_blake3 {
-        let actual_hash = blake3_file(&link.target)?;
+    ensure_target_path_is_unchanged(&link.target, link.target_blake3.as_ref())
+}
+
+fn ensure_target_path_is_unchanged(path: &Path, expected_hash: Option<&String>) -> Result<()> {
+    if !path.exists() {
+        bail!("target is missing: {}", path.display());
+    }
+
+    if let Some(expected) = expected_hash {
+        let actual_hash = blake3_file(path)?;
         if actual_hash != *expected {
             bail!(
                 "refusing to use {} because its hash changed: expected {}, got {}",
-                link.target.display(),
+                path.display(),
                 expected,
                 actual_hash
             );
         }
+    }
+
+    Ok(())
+}
+
+fn write_service_override_atomic(service: &ServiceRecord) -> Result<()> {
+    let parent = service.override_path.parent().ok_or_else(|| {
+        anyhow!(
+            "systemd override path has no parent: {}",
+            service.override_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let temporary = parent.join(format!(
+        ".forkpkg.conf.tmp.{}.{}",
+        std::process::id(),
+        unix_time_secs()?
+    ));
+    let text = format!(
+        "\
+[Service]
+ExecStart=
+ExecStart={}
+",
+        service.exec_start
+    );
+
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temporary.display()))?;
+        fs::rename(&temporary, &service.override_path).with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                temporary.display(),
+                service.override_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+
+    write_result
+}
+
+fn systemctl_user<const N: usize>(args: [&str; N]) -> Result<()> {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .context("failed to execute systemctl --user")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "systemctl --user failed with status {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     Ok(())
@@ -704,6 +1058,13 @@ pub fn activations_dir() -> Result<PathBuf> {
 
 fn user_bin_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".local").join("bin"))
+}
+
+fn user_config_dir() -> Result<PathBuf> {
+    Ok(match env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+        Some(path) if path.is_absolute() => path,
+        _ => home_dir()?.join(".config"),
+    })
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -740,11 +1101,18 @@ nixpkgs_path={}\n",
 }
 
 fn record_paths_for_metadata(metadata: &Metadata, paths: &ActivationPaths) -> Vec<PathBuf> {
-    let current_key = package_key(metadata);
+    let current_key = fork_key(metadata);
     let legacy_key = workspace::sanitize_workspace_name(&package_display_name(metadata));
+    let package_key = package_key(metadata);
     let mut keys = vec![current_key];
-    if keys[0] != legacy_key {
-        keys.push(legacy_key);
+
+    if metadata.fork_label() == workspace::DEFAULT_LABEL {
+        if !keys.contains(&package_key) {
+            keys.push(package_key);
+        }
+        if !keys.contains(&legacy_key) {
+            keys.push(legacy_key);
+        }
     }
 
     keys.into_iter()
@@ -785,8 +1153,17 @@ fn unix_time_secs() -> Result<u64> {
 
 #[derive(Debug)]
 enum EnableUndo {
-    RemoveCreated { link: PathBuf },
-    RestorePrevious { link: PathBuf, backup: PathBuf },
+    RemoveCreated {
+        link: PathBuf,
+    },
+    RestorePrevious {
+        link: PathBuf,
+        backup: PathBuf,
+    },
+    RemoveCreatedServiceOverride {
+        service: String,
+        override_path: PathBuf,
+    },
 }
 
 fn rollback_enable(mut undo: Vec<EnableUndo>) -> Result<()> {
@@ -818,6 +1195,18 @@ fn rollback_enable(mut undo: Vec<EnableUndo>) -> Result<()> {
                     Ok(())
                 }
             }
+            EnableUndo::RemoveCreatedServiceOverride {
+                service,
+                override_path,
+            } => {
+                if link_exists(&override_path)? {
+                    fs::remove_file(&override_path)
+                        .with_context(|| format!("failed to remove {}", override_path.display()))?;
+                }
+                systemctl_user(["daemon-reload"])?;
+                let _ = systemctl_user(["restart", service.as_str()]);
+                Ok(())
+            }
         };
 
         if let Err(error) = result {
@@ -842,6 +1231,11 @@ enum DisableUndo {
         link: PathBuf,
         target: PathBuf,
         backup: PathBuf,
+    },
+    RestoreServiceOverride {
+        service: String,
+        override_path: PathBuf,
+        text: String,
     },
 }
 
@@ -878,6 +1272,25 @@ fn rollback_disable(mut undo: Vec<DisableUndo>) -> Result<()> {
                 }
                 Ok(())
             }
+            DisableUndo::RestoreServiceOverride {
+                service,
+                override_path,
+                text,
+            } => {
+                let parent = override_path.parent().ok_or_else(|| {
+                    anyhow!(
+                        "systemd override path has no parent: {}",
+                        override_path.display()
+                    )
+                })?;
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+                fs::write(&override_path, text)
+                    .with_context(|| format!("failed to restore {}", override_path.display()))?;
+                systemctl_user(["daemon-reload"])?;
+                let _ = systemctl_user(["restart", service.as_str()]);
+                Ok(())
+            }
         };
 
         if let Err(error) = result {
@@ -900,12 +1313,13 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::metadata::{BaseMetadata, BuildMetadata, Metadata, PackageMetadata};
+    use crate::metadata::{BaseMetadata, BuildMetadata, ForkMetadata, Metadata, PackageMetadata};
 
     use super::{
         ActivationPaths, ActivationRecordEntry, PreviousLink, apply_disable_record,
         apply_enable_record, executable_entries, list_record_entries_with_paths, package_key,
-        plan_path_shim_with_paths, read_record, read_record_for_metadata,
+        plan_path_shim_with_paths, plan_systemd_user_service_with_paths, read_record,
+        read_record_for_metadata,
     };
 
     #[test]
@@ -1042,6 +1456,48 @@ mod tests {
     }
 
     #[test]
+    fn plans_systemd_user_service_activation_record() {
+        let fixture = Fixture::new();
+        let metadata = metadata_for("nixpkgs#portal", "portal", "x86_64-linux");
+        let target = fixture.build_output.join("libexec/portal");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        write_mode(&target, "#!/bin/sh\n", 0o755);
+        let service_file = fixture
+            .build_output
+            .join("share/systemd/user/portal.service");
+        fs::create_dir_all(service_file.parent().unwrap()).unwrap();
+        fs::write(&service_file, "[Service]\n").unwrap();
+        let exec_start = target.display().to_string();
+
+        let record = plan_systemd_user_service_with_paths(
+            &metadata,
+            &fixture.workspace,
+            &fixture.build_output,
+            "portal.service",
+            &service_file,
+            &exec_start,
+            &target,
+            &fixture.paths,
+        )
+        .unwrap();
+
+        assert_eq!(record.mode, "systemd-user-service");
+        assert!(record.links.is_empty());
+        assert_eq!(record.services.len(), 1);
+        assert_eq!(record.services[0].service, "portal.service");
+        assert_eq!(record.services[0].exec_start, exec_start);
+        assert_eq!(record.services[0].target, target);
+        assert!(record.services[0].target_blake3.is_some());
+        assert_eq!(
+            record.services[0].override_path,
+            fixture
+                .paths
+                .user_config_dir
+                .join("systemd/user/portal.service.d/forkpkg.conf")
+        );
+    }
+
+    #[test]
     fn metadata_lookup_falls_back_to_legacy_activation_key() {
         let fixture = Fixture::new();
         let metadata = metadata_for("nixpkgs#hello", "hello", "x86_64-linux");
@@ -1114,10 +1570,12 @@ links = []
             let source = workspace_root.join("source");
             let build_output = root.join("build-output");
             let user_bin = root.join("home/.local/bin");
+            let user_config = root.join("home/.config");
             let activations = root.join("state/forkpkg/activations");
             fs::create_dir_all(&source).unwrap();
             fs::create_dir_all(build_output.join("bin")).unwrap();
             fs::create_dir_all(&user_bin).unwrap();
+            fs::create_dir_all(&user_config).unwrap();
             fs::create_dir_all(&activations).unwrap();
             fs::write(workspace_root.join("forkpkg.toml"), "").unwrap();
 
@@ -1126,6 +1584,7 @@ links = []
                 paths: ActivationPaths {
                     activations_dir: activations,
                     user_bin_dir: user_bin,
+                    user_config_dir: user_config,
                 },
                 workspace: crate::workspace::Workspace::new(workspace_root),
                 build_output,
@@ -1150,6 +1609,9 @@ links = []
     fn metadata_for(installable: &str, attribute: &str, system: &str) -> Metadata {
         Metadata {
             format: 1,
+            fork: ForkMetadata {
+                label: "default".to_owned(),
+            },
             package: PackageMetadata {
                 installable: installable.to_owned(),
                 flake_ref: installable.split_once('#').unwrap().0.to_owned(),

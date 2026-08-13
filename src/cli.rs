@@ -16,6 +16,10 @@ pub enum Command {
     Fork {
         /// Nix installable, for example nixpkgs#ripgrep.
         installable: String,
+
+        /// Fork label. The first fork defaults to "default"; additional forks require a label.
+        #[arg(long)]
+        label: Option<String>,
     },
 
     /// List managed forks.
@@ -32,6 +36,28 @@ pub enum Command {
         path: Option<PathBuf>,
     },
 
+    /// Export committed fork changes as a portable share artifact.
+    Export {
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
+        path: Option<PathBuf>,
+
+        /// Artifact path to create.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+
+    /// Import a fork share artifact into a clean matching fork.
+    Import {
+        /// Artifact created by forkpkg export.
+        #[arg(value_name = "FILE")]
+        artifact: PathBuf,
+
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
+        path: Option<PathBuf>,
+    },
+
     /// Print metadata for a fork workspace.
     Info {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
@@ -39,11 +65,26 @@ pub enum Command {
         path: Option<PathBuf>,
     },
 
+    /// Discover activation targets for a fork.
+    Targets {
+        /// Fork name, workspace, or source directory. Defaults to the current directory.
+        #[arg(value_name = "FORK")]
+        path: Option<PathBuf>,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Make this machine use the forked build output.
     Enable {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Activation target id, for example path-shim or systemd-user:name.service.
+        #[arg(long)]
+        target: Option<String>,
 
         /// Preview activation without changing local machine state.
         #[arg(long)]
@@ -55,6 +96,10 @@ pub enum Command {
         /// Fork name, workspace, or source directory. Defaults to the current directory.
         #[arg(value_name = "FORK")]
         path: Option<PathBuf>,
+
+        /// Activation target id, for example path-shim or systemd-user:name.service.
+        #[arg(long)]
+        target: Option<String>,
 
         /// Preview deactivation without changing local machine state.
         #[arg(long)]

@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -10,6 +10,8 @@ pub struct Workspace {
     pub source: PathBuf,
     pub metadata: PathBuf,
 }
+
+pub const DEFAULT_LABEL: &str = "default";
 
 impl Workspace {
     pub fn new(root: PathBuf) -> Self {
@@ -34,12 +36,22 @@ pub fn state_home() -> Result<PathBuf> {
     })
 }
 
-pub fn managed_workspace(name: &str) -> Result<PathBuf> {
-    Ok(forks_dir()?.join(sanitize_workspace_name(name)))
+pub fn managed_workspace(package: &str, label: &str) -> Result<PathBuf> {
+    Ok(forks_dir()?
+        .join(sanitize_workspace_name(package))
+        .join(sanitize_workspace_name(label)))
 }
 
-pub fn create_managed(name: &str) -> Result<Workspace> {
-    let root = managed_workspace(name)?;
+pub fn legacy_workspace(package: &str) -> Result<PathBuf> {
+    Ok(forks_dir()?.join(sanitize_workspace_name(package)))
+}
+
+pub fn legacy_workspace_exists(package: &str) -> Result<bool> {
+    Ok(legacy_workspace(package)?.join("forkpkg.toml").is_file())
+}
+
+pub fn create_managed(package: &str, label: &str) -> Result<Workspace> {
+    let root = managed_workspace(package, label)?;
     if root.exists() {
         bail!("fork workspace already exists: {}", root.display());
     }
@@ -64,6 +76,22 @@ pub fn list_managed() -> Result<Vec<Workspace>> {
         let path = entry.path();
         if path.join("forkpkg.toml").is_file() {
             workspaces.push(Workspace::new(path));
+            continue;
+        }
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        for label_entry in
+            fs::read_dir(&path).with_context(|| format!("failed to read {}", path.display()))?
+        {
+            let label_entry = label_entry
+                .with_context(|| format!("failed to read entry in {}", path.display()))?;
+            let label_path = label_entry.path();
+            if label_path.join("forkpkg.toml").is_file() {
+                workspaces.push(Workspace::new(label_path));
+            }
         }
     }
 
@@ -111,16 +139,140 @@ pub fn resolve(reference: Option<PathBuf>) -> Result<Workspace> {
         return find(Some(reference));
     }
 
-    if reference.components().count() == 1 {
-        let name = reference.to_string_lossy();
-        let root = managed_workspace(&name)?;
-        if root.join("forkpkg.toml").is_file() {
-            return Ok(Workspace::new(root));
-        }
-        bail!("no managed fork named {name:?} found at {}", root.display());
+    if let Some((package, label)) = managed_reference(&reference) {
+        return resolve_managed_reference(&package, label.as_deref());
     }
 
     bail!("path does not exist: {}", reference.display());
+}
+
+fn resolve_managed_reference(package: &str, label: Option<&str>) -> Result<Workspace> {
+    if let Some(label) = label {
+        if label == DEFAULT_LABEL {
+            let legacy = legacy_workspace(package)?;
+            if legacy.join("forkpkg.toml").is_file() {
+                return Ok(Workspace::new(legacy));
+            }
+        }
+
+        let root = managed_workspace(package, label)?;
+        if root.join("forkpkg.toml").is_file() {
+            return Ok(Workspace::new(root));
+        }
+        bail!("no managed fork named {package}/{label} found");
+    }
+
+    let legacy = legacy_workspace(package)?;
+    if legacy.join("forkpkg.toml").is_file() {
+        return Ok(Workspace::new(legacy));
+    }
+
+    let default = managed_workspace(package, DEFAULT_LABEL)?;
+    if default.join("forkpkg.toml").is_file() {
+        return Ok(Workspace::new(default));
+    }
+
+    let workspaces = list_package(package)?;
+    match workspaces.as_slice() {
+        [workspace] => Ok(Workspace::new(workspace.root.clone())),
+        [] => bail!(
+            "no managed fork named {package:?} found under {}",
+            forks_dir()?.display()
+        ),
+        _ => bail!("managed fork name {package:?} is ambiguous; use {package}/<label>"),
+    }
+}
+
+fn managed_reference(reference: &Path) -> Option<(String, Option<String>)> {
+    let mut parts = Vec::new();
+    for component in reference.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => return None,
+        }
+    }
+
+    match parts.as_slice() {
+        [package] => Some((package.clone(), None)),
+        [package, label] => Some((package.clone(), Some(label.clone()))),
+        _ => None,
+    }
+}
+
+pub fn list_package(package: &str) -> Result<Vec<Workspace>> {
+    let mut workspaces = Vec::new();
+
+    let legacy = legacy_workspace(package)?;
+    if legacy.join("forkpkg.toml").is_file() {
+        workspaces.push(Workspace::new(legacy));
+    }
+
+    let package_dir = forks_dir()?.join(sanitize_workspace_name(package));
+    if package_dir.is_dir() && !package_dir.join("forkpkg.toml").is_file() {
+        for entry in fs::read_dir(&package_dir)
+            .with_context(|| format!("failed to read {}", package_dir.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("failed to read entry in {}", package_dir.display()))?;
+            let path = entry.path();
+            if path.join("forkpkg.toml").is_file() {
+                workspaces.push(Workspace::new(path));
+            }
+        }
+    }
+
+    workspaces.sort_by(|left, right| left.root.cmp(&right.root));
+    Ok(workspaces)
+}
+
+pub fn migrate_legacy_to_default(package: &str) -> Result<Option<Workspace>> {
+    let legacy = legacy_workspace(package)?;
+    if !legacy.join("forkpkg.toml").is_file() {
+        return Ok(None);
+    }
+
+    let default = managed_workspace(package, DEFAULT_LABEL)?;
+    if default.exists() {
+        bail!(
+            "cannot migrate legacy fork because default fork already exists: {}",
+            default.display()
+        );
+    }
+
+    let forks = forks_dir()?;
+    let temporary = forks.join(format!(
+        ".{}-migrating-{}",
+        sanitize_workspace_name(package),
+        std::process::id()
+    ));
+    if temporary.exists() {
+        bail!(
+            "temporary migration path already exists: {}",
+            temporary.display()
+        );
+    }
+
+    fs::rename(&legacy, &temporary).with_context(|| {
+        format!(
+            "failed to move legacy fork {} to {}",
+            legacy.display(),
+            temporary.display()
+        )
+    })?;
+    fs::create_dir_all(&legacy)
+        .with_context(|| format!("failed to create {}", legacy.display()))?;
+    fs::rename(&temporary, &default).with_context(|| {
+        format!(
+            "failed to move legacy fork {} to {}",
+            temporary.display(),
+            default.display()
+        )
+    })?;
+
+    Ok(Some(Workspace::new(default)))
 }
 
 pub fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
