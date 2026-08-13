@@ -21,6 +21,9 @@ Then change into the `source:` directory printed by `forkpkg` and edit files.
 
 ## Enable/Disable Forks
 
+Enable the fork, run the command as usual, then disable it when you want to go
+back to the previous package:
+
 ```sh
 forkpkg enable hello
 hello
