@@ -17,8 +17,9 @@ package is rebuilt and activated by the original package definition.
 forkpkg fork nixpkgs#hello
 ```
 
-Then change into the `source:` directory printed by `forkpkg`, edit files, and
-enable the fork:
+Then change into the `source:` directory printed by `forkpkg` and edit files.
+
+## Enable/Disable Forks
 
 ```sh
 forkpkg enable hello
