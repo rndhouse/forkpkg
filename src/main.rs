@@ -8,6 +8,7 @@ mod targets;
 mod workspace;
 
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -39,8 +40,10 @@ fn run() -> Result<()> {
             path,
             backend,
             profile,
+            switch,
+            flake,
             dry_run,
-        } => enable(path, backend, profile, dry_run),
+        } => enable(path, backend, profile, switch, flake.as_deref(), dry_run),
         Command::Disable { path, dry_run } => disable(path, dry_run),
         Command::DisableAll { dry_run } => disable_all(dry_run),
         Command::Doctor => doctor(),
@@ -502,6 +505,8 @@ fn enable(
     path: Option<PathBuf>,
     requested_backend: ActivationBackend,
     profile: Option<PathBuf>,
+    switch: bool,
+    flake: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
     let workspace = workspace::resolve(path)?;
@@ -517,6 +522,14 @@ fn enable(
 
     if profile.is_some() && backend != ActivationBackend::NixProfile {
         anyhow::bail!("--profile only applies to --backend nix-profile");
+    }
+    if flake.is_some() && !switch {
+        anyhow::bail!("--flake only applies with --switch");
+    }
+    if switch && backend == ActivationBackend::NixProfile {
+        anyhow::bail!(
+            "--switch only applies to module backends; nix-profile activates immediately"
+        );
     }
 
     let record = match backend {
@@ -550,6 +563,7 @@ fn enable(
     println!("output: {}", record.build_output.display());
     print_profile_records(&record, dry_run);
     print_module_records(&record, dry_run);
+    maybe_switch_backend(backend, switch, flake, dry_run)?;
 
     Ok(())
 }
@@ -935,6 +949,92 @@ fn print_module_records(record: &activation::ActivationRecord, dry_run: bool) {
     }
 }
 
+fn maybe_switch_backend(
+    backend: ActivationBackend,
+    switch: bool,
+    flake: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    if !switch {
+        return Ok(());
+    }
+
+    let command = switch_command(backend, flake)?;
+    if dry_run {
+        println!("would run: {}", command.display());
+        return Ok(());
+    }
+
+    eprintln!("running {}", command.display());
+    command.run()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwitchCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+impl SwitchCommand {
+    fn display(&self) -> String {
+        std::iter::once(self.program.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .map(shell_display_word)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn run(&self) -> Result<()> {
+        let status = ProcessCommand::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("failed to execute {}", self.program))?;
+
+        if !status.success() {
+            anyhow::bail!("{} failed with status {}", self.display(), status);
+        }
+
+        Ok(())
+    }
+}
+
+fn switch_command(backend: ActivationBackend, flake: Option<&str>) -> Result<SwitchCommand> {
+    let mut command = match backend {
+        ActivationBackend::NixosModule => SwitchCommand {
+            program: "sudo".to_owned(),
+            args: vec!["nixos-rebuild".to_owned(), "switch".to_owned()],
+        },
+        ActivationBackend::HomeManagerModule => SwitchCommand {
+            program: "home-manager".to_owned(),
+            args: vec!["switch".to_owned()],
+        },
+        ActivationBackend::Auto | ActivationBackend::NixProfile => {
+            anyhow::bail!("backend has no switch command: {backend:?}")
+        }
+    };
+
+    if let Some(flake) = flake {
+        command.args.push("--flake".to_owned());
+        command.args.push(flake.to_owned());
+    }
+
+    Ok(command)
+}
+
+fn shell_display_word(word: &str) -> String {
+    if word
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '#'))
+    {
+        return word.to_owned();
+    }
+
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 fn record_target_ids(record: &activation::ActivationRecord) -> Vec<String> {
     let mut ids = Vec::new();
     if !record.links.is_empty() {
@@ -1188,4 +1288,37 @@ fn print_indented_target_blake3(link: &activation::LinkRecord, verified: bool) {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActivationBackend, switch_command};
+
+    #[test]
+    fn nixos_switch_command_uses_sudo_and_optional_flake() {
+        let command = switch_command(
+            ActivationBackend::NixosModule,
+            Some("/home/user/nixos#tower"),
+        )
+        .unwrap();
+
+        assert_eq!(command.program, "sudo");
+        assert_eq!(
+            command.args,
+            [
+                "nixos-rebuild",
+                "switch",
+                "--flake",
+                "/home/user/nixos#tower"
+            ]
+        );
+    }
+
+    #[test]
+    fn home_manager_switch_command_does_not_use_sudo() {
+        let command = switch_command(ActivationBackend::HomeManagerModule, None).unwrap();
+
+        assert_eq!(command.program, "home-manager");
+        assert_eq!(command.args, ["switch"]);
+    }
 }

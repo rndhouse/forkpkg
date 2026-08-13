@@ -90,6 +90,14 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         profile: Option<PathBuf>,
 
+        /// Run the backend's normal switch command after preparing module activation.
+        #[arg(long)]
+        switch: bool,
+
+        /// Flake reference for --switch, for example /etc/nixos#host.
+        #[arg(long, value_name = "REF")]
+        flake: Option<String>,
+
         /// Preview activation without changing local machine state.
         #[arg(long)]
         dry_run: bool,
