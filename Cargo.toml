@@ -2,7 +2,13 @@
 name = "forkpkg"
 version = "0.1.0"
 edition = "2024"
+description = "Create editable local source forks of Nix packages"
 license = "MIT"
+repository = "https://github.com/rndhouse/forkpkg"
+readme = "README.md"
+keywords = ["nix", "nixos", "git", "patch", "fork"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["AGENTS.md", "assets/forkpkg-logo.png"]
 
 [dependencies]
 anyhow = "1.0"
